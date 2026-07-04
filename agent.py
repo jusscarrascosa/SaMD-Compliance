@@ -71,23 +71,44 @@ def run_analysis(repo_path: str) -> dict:
 
         # --- PASO 3: el VALIDADOR DETERMINÍSTICO decide (SIN LLM) ---
         evidence = spec["validator"](repo)
-        satisfied = evidence is not None
+        validation_status = (evidence or {}).get("validation_status")
+        if evidence is None:
+            status = "gap"
+            confidence = "proposed"
+            severity = 9.0
+        elif validation_status == "partial":
+            status = "partial"
+            confidence = "validated"
+            severity = 6.0
+        else:
+            status = "satisfied"
+            confidence = "validated"
+            severity = 2.0
 
         # --- PASO 4: scoring por impacto en el paciente ---
         touches_phi = spec["clinical_proximity"] in ("diagnostic_decision", "data_storage")
-        severity = 9.0 if not satisfied else 2.0  # un gap pesa más
-        score = patient_risk_score(severity, spec["clinical_proximity"], touches_phi)
+        # Nivel CSF alcanzado: mapeo directo desde el resultado del validador
+        # (none / partial / level_1) o override opcional en CONTROL_REGISTRY.
+        compliance_level = spec.get("compliance_level") or {
+            "gap": "none",
+            "partial": "partial",
+            "satisfied": "level_1",
+        }[status]
+        score = patient_risk_score(
+            severity, spec["clinical_proximity"], touches_phi, compliance_level
+        )
 
         results.append({
             "control_id": control_id,
             "name": spec["name"],
             "framework_refs": spec["framework_refs"],
-            "status": "satisfied" if satisfied else "gap",
+            "status": status,
             # LA LÍNEA CLAVE: proposed vs validated
-            "confidence": "validated" if satisfied else "proposed",
+            "confidence": confidence,
             "llm_proposal": proposal,
             "evidence": evidence,
             "clinical_proximity": spec["clinical_proximity"],
+            "compliance_level": compliance_level,
             "patient_risk_score": score,
         })
 
@@ -100,5 +121,5 @@ def run_analysis(repo_path: str) -> dict:
             "clinical_modules": inventory["clinical_modules"],
         },
         "controls": results,
-        "gaps": [r for r in results if r["status"] == "gap"],
+        "gaps": [r for r in results if r["status"] in ("gap", "partial")],
     }

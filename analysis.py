@@ -5,6 +5,113 @@ Traducción del DCA de Apiiro: entender qué maneja cada módulo.
 """
 from __future__ import annotations
 from pathlib import Path
+from typing import Literal
+
+# Niveles de cumplimiento alcanzado, alineados con el CSF de HITRUST.
+# Referencia: HITRUST CSF v11.8, sección "Implementation Requirement Levels"
+# (https://hitrustalliance.net) — tres niveles progresivos y acumulativos
+# (Level 1 → Level 2 → Level 3) más requisitos segment-specific (FedRAMP, GDPR).
+ComplianceLevel = Literal["none", "partial", "level_1", "level_2", "level_3", "segment"]
+
+# --- Proximidad clínica → peso de impacto al paciente ---
+#
+# El CSF clasifica riesgo en tres factores (Organizational, System, Compliance)
+# que determinan el nivel de implementación exigido por control. Mapeamos la
+# proximidad clínica del módulo al grado de exposición del paciente si el control
+# falla, usando la misma lógica de escalamiento progresivo:
+#
+#   diagnostic_decision = 1.0
+#     Equivalente al escenario de System + Compliance Factors elevados (CSF
+#     Level 3): el control protege un sistema que interviene directamente en
+#     decisiones clínicas (p. ej. motor diagnóstico SaMD, IEC 62304 clase C /
+#     ISO 14971 — daño directo al paciente). Peso máximo: falla = impacto clínico
+#     inmediato, no solo confidencialidad.
+#
+#   access_control = 0.7
+#     Equivalente a CSF Level 2 (System Factors): autenticación, acceso remoto,
+#     terceros. El CSF exige controles adicionales ~30-40 % más estrictos en
+#     Level 2 vs Level 1; un gap de acceso requiere explotación adicional antes
+#     de afectar una decisión clínica. 0.7 ≈ 1 − (1/3): un escalón por debajo
+#     del impacto diagnóstico directo, coherente con la distancia Level 2→3
+#     en la guía de Risk Analysis del CSF.
+#
+#   data_storage = 0.6
+#     Equivalente a CSF Level 1 (baseline organizacional): cifrado en reposo,
+#     retención — requisito mínimo de protección de PHI (HIPAA §164.312(a)(2)(iv)
+#     integrado en Level 1). El daño primario es confidencialidad/integridad del
+#     dato, no una acción clínica errónea. 0.6 = Level1/Level3 (1/1.67): ratio
+#     derivado de la progresión acumulativa de requisitos del CSF.
+#
+#   administrative = 0.3
+#     Controles de gobernanza sin exposición directa a PHI clínico (CSF
+#     dominios 00.x — políticas, capacitación). Impacto indirecto al paciente.
+_PROXIMITY_WEIGHT: dict[str, float] = {
+    "diagnostic_decision": 1.0,
+    "access_control": 0.7,
+    "data_storage": 0.6,
+    "administrative": 0.3,
+}
+
+# --- Nivel de cumplimiento alcanzado → factor de riesgo residual ---
+#
+# El CSF evalúa cada requisito contra niveles de madurez (Policy 15 %, Procedure
+# 20 %, Implemented 40 %, Measured 10 %, Managed 15 %) y grados de
+# implementación (NC 0 %, SC 25 %, PC 75 %, FC 100 %). El factor below
+# representa el riesgo RESIDUAL al paciente: mayor cumplimiento → menor factor.
+#
+#   none = 1.0
+#     NC (No Compliance): ningún elemento del requisito implementado (CSF
+#     maturity scoring = 0 %). Exposición total; sin compensación verificable.
+#
+#   partial = 0.80
+#     SC/PC (Some/Partial Compliance): elementos parciales del requisito (25-75 %
+#     según escala CSF). Mitigación insuficiente para certificación i1/r2
+#     (mínimo Implemented = 40 % del score de madurez). 0.80 refleja que ~20 %
+#     del riesgo base queda cubierto por controles incompletos.
+#
+#   level_1 = 0.65
+#     CSF Implementation Level 1: baseline mínimo (factores organizacionales —
+#     tamaño, volumen de PHI). Cumple el piso HIPAA pero sin controles de System
+#     Factors. Un gap aquí implica incumplimiento del requisito más básico;
+#     0.65 = 1 − 0.35, donde 0.35 ≈ peso relativo de Level 1 dentro del stack
+#     acumulativo (Level 1 es ~35 % del total de requisitos en controles típicos
+#     de PHI según Risk Analysis Guide, Tabla 1).
+#
+#   level_2 = 0.45
+#     CSF Level 2: Level 1 + System Factors (acceso remoto, dispositivos móviles,
+#     terceros). Controles adicionales ~30 % más restrictivos. Factor 0.45 =
+#     riesgo residual tras cubrir dos tercios del stack (1 − 2/3 ≈ 0.33, ajustado
+#     al 0.45 para reflejar que Level 2 no incluye aún Compliance Factors
+#     regulatorios).
+#
+#   level_3 = 0.30
+#     CSF Level 3: Level 1 + 2 + Compliance Factors (mapeos a NIST 800-53,
+#     FedRAMP, FISMA, GDPR). Máximo rigor en requisitos generales del CSF.
+#     Factor 0.30 = riesgo residual mínimo antes de segment-specific; alinea con
+#     el 30 % de controles adicionales que Level 3 agrega sobre Level 2 en la
+#     progresión acumulativa del framework.
+#
+#   segment = 0.20
+#     Segment-Specific Requirements (CSF: FedRAMP r5, GDPR, cloud CSP). Capa
+#     adicional sobre Level 3 para industrias/regulaciones específicas. 0.20 =
+#     riesgo residual más bajo: cumplimiento verificado contra el estándar más
+#     exigente aplicable (p. ej. FedRAMP Moderate baseline vía mapeo CSF).
+_COMPLIANCE_RISK_FACTOR: dict[ComplianceLevel, float] = {
+    "none": 1.0,
+    "partial": 0.80,
+    "level_1": 0.65,
+    "level_2": 0.45,
+    "level_3": 0.30,
+    "segment": 0.20,
+}
+
+# --- Sensibilidad del dato (PHI) ---
+#
+# CSF Organizational Factors: volumen y sensibilidad de la información determinan
+# el nivel de implementación exigido. Módulos que procesan PHI activan factores
+# de riesgo elevados; los demás reciben peso reducido (0.5) porque un gap no
+# expone datos de pacientes identificables.
+_PHI_WEIGHT = {"touches": 1.0, "no_phi": 0.5}
 
 
 def build_inventory(repo: Path) -> dict:
@@ -31,18 +138,29 @@ def build_inventory(repo: Path) -> dict:
     }
 
 
-def patient_risk_score(security_severity: float,
-                       clinical_proximity: str,
-                       touches_phi: bool) -> float:
-    """Patient Risk Score (§6 de tu doc): producto de tres vectores.
-    Rango 0-10. Un gap en un módulo de decisión diagnóstica que toca PHI
-    pesa mucho más que uno administrativo."""
-    proximity_weight = {
-        "diagnostic_decision": 1.0,
-        "access_control": 0.7,
-        "data_storage": 0.6,
-        "administrative": 0.3,
-    }.get(clinical_proximity, 0.4)
-    phi_weight = 1.0 if touches_phi else 0.5
-    raw = security_severity * proximity_weight * phi_weight
+def patient_risk_score(
+    security_severity: float,
+    clinical_proximity: str,
+    touches_phi: bool,
+    compliance_level: ComplianceLevel = "none",
+) -> float:
+    """Patient Risk Score (§6): producto de cuatro vectores alineados al CSF.
+
+    score = severity × proximity × phi_sensitivity × compliance_residual
+
+    Rango 0–10. Un gap en decisión diagnóstica con PHI y sin cumplimiento
+    (none) pesa mucho más que uno administrativo con Level 1 parcialmente
+    implementado.
+
+    Args:
+        security_severity: Magnitud del gap (9.0) o control satisfecho (2.0).
+        clinical_proximity: Proximidad al flujo clínico del paciente.
+        touches_phi: Si el control protege datos identificables de pacientes.
+        compliance_level: Nivel de implementación CSF alcanzado por el control.
+            Valores: none | partial | level_1 | level_2 | level_3 | segment.
+    """
+    proximity_weight = _PROXIMITY_WEIGHT.get(clinical_proximity, 0.4)
+    phi_weight = _PHI_WEIGHT["touches"] if touches_phi else _PHI_WEIGHT["no_phi"]
+    compliance_factor = _COMPLIANCE_RISK_FACTOR.get(compliance_level, 1.0)
+    raw = security_severity * proximity_weight * phi_weight * compliance_factor
     return round(min(raw, 10.0), 1)

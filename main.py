@@ -97,6 +97,7 @@ async def get_evidence(job_id: str, control_id: str, request: Request):
         "evidence": ctrl["evidence"],              # la prueba verificable (o null)
         "patient_risk_score": ctrl["patient_risk_score"],
         "clinical_proximity": ctrl["clinical_proximity"],
+        "compliance_level": ctrl.get("compliance_level"),
         "auditor_note": (
             "Certificado por validador determinístico con evidencia reproducible."
             if ctrl["confidence"] == "validated"
