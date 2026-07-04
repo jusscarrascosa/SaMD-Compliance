@@ -49,11 +49,11 @@ async def _worker(job_id: str, target: str):
 
 
 PRISMA_LEVELS = [
-    ("Policy", 0, "Documentación de políticas de seguridad y privacidad."),
-    ("Procedure", 25, "Procedimientos operativos documentados y asignados."),
-    ("Implemented", 50, "Controles implementados técnicamente en el sistema."),
-    ("Measured", 75, "Controles medidos y monitoreados con métricas."),
-    ("Managed", 100, "Controles gestionados continuamente con mejora."),
+    ("Policy", 0, "Security and privacy policy documentation."),
+    ("Procedure", 25, "Documented and assigned operational procedures."),
+    ("Implemented", 50, "Controls technically implemented in the system."),
+    ("Measured", 75, "Controls measured and monitored with metrics."),
+    ("Managed", 100, "Controls continuously managed with improvement."),
 ]
 
 E1_TOTAL_CONTROL_REFS = 44
@@ -66,28 +66,28 @@ HITRUST_DOMAIN_NAMES: dict[str, str] = {
 
 _CAP_SUGGESTIONS: dict[str, str] = {
     "HITRUST-06.d": (
-        "Implementar cifrado en reposo (KMS, storage_encrypted o equivalente) "
-        "para datos cubiertos en almacenamiento y bases de datos que contienen PHI."
+        "Implement encryption at rest (KMS, storage_encrypted, or equivalent) "
+        "for covered data in storage and databases containing PHI."
     ),
     "HITRUST-01.q": (
-        "Implementar autenticación multifactor (MFA) y verificación de identidad "
-        "de usuario en los puntos de acceso a sistemas que procesan PHI."
+        "Implement multi-factor authentication (MFA) and user identity verification "
+        "at access points to systems that process PHI."
     ),
     "HITRUST-09.aa": (
-        "Implementar audit logging con user_id, timestamp y retención "
-        "en los módulos que tocan PHI."
+        "Implement audit logging with user_id, timestamp, and retention "
+        "in modules that handle PHI."
     ),
     "HITRUST-09.l": (
-        "Implementar backups automatizados con retención definida "
-        "(RDS snapshot, AWS Backup o pg_dump programado) para datos clínicos."
+        "Implement automated backups with defined retention "
+        "(RDS snapshot, AWS Backup, or scheduled pg_dump) for clinical data."
     ),
     "HITRUST-01.b": (
-        "Configurar timeout de sesión e idle timeout (p. ej. SESSION_TIMEOUT, "
-        "expires_in o maxAge de cookie) en puntos de acceso al sistema."
+        "Configure session timeout and idle timeout (e.g. SESSION_TIMEOUT, "
+        "expires_in, or cookie maxAge) at system access points."
     ),
     "HITRUST-06.h": (
-        "Definir política de retención y disposición de datos (retention_period, "
-        "purge, delete_after) para registros clínicos y PHI."
+        "Define data retention and disposal policy (retention_period, "
+        "purge, delete_after) for clinical records and PHI."
     ),
 }
 
@@ -166,10 +166,10 @@ def _control_display_name(ctrl: dict) -> str:
 
 def _readiness_from_score(score: float) -> tuple[str, str]:
     if score >= 75:
-        return "Alta", "readiness-high"
+        return "High", "readiness-high"
     if score >= 40:
-        return "Parcial", "readiness-partial"
-    return "Baja", "readiness-low"
+        return "Partial", "readiness-partial"
+    return "Low", "readiness-low"
 
 
 def _render_verdict_section(
@@ -186,22 +186,22 @@ def _render_verdict_section(
         gap_score = top_gap.get("patient_risk_score", 0)
         critical_html = f"""
       <p class="verdict-critical">
-        Prioridad crítica: <strong>{gap_label}</strong>
-        — riesgo al paciente {gap_score:.1f}
+        Critical priority: <strong>{gap_label}</strong>
+        — patient risk {gap_score:.1f}
       </p>"""
     else:
         critical_html = """
       <p class="verdict-critical verdict-clear">
-        Sin gaps críticos detectados en los controles evaluados.
+        No critical gaps detected in evaluated controls.
       </p>"""
 
     return f"""
-    <section class="verdict" aria-label="Veredicto de compliance">
+    <section class="verdict" aria-label="Compliance verdict">
       <div class="verdict-main">
         <div class="verdict-score-block">
           <div class="verdict-score">{score_display}</div>
           <div class="verdict-score-label">Compliance Score</div>
-          <div class="verdict-score-detail">{validated} de {total} controles validados</div>
+          <div class="verdict-score-detail">{validated} of {total} controls validated</div>
         </div>
         <div class="verdict-readiness">
           <span class="readiness-label">Readiness</span>
@@ -216,8 +216,8 @@ def _render_action_plan(gaps: list[dict]) -> str:
     if not gaps:
         return """
     <section class="report-section action-plan">
-      <h2 class="section-heading">Plan de acción</h2>
-      <p class="section-empty">No se identificaron gaps. Todos los controles evaluados tienen evidencia validada.</p>
+      <h2 class="section-heading">Action Plan</h2>
+      <p class="section-empty">No gaps identified. All evaluated controls have validated evidence.</p>
     </section>"""
 
     items = []
@@ -231,7 +231,7 @@ def _render_action_plan(gaps: list[dict]) -> str:
           <div class="action-body">
             <div class="action-title">
               <span class="action-name">{label}</span>
-              <span class="risk-score">riesgo {score:.1f}</span>
+              <span class="risk-score">risk {score:.1f}</span>
             </div>
             <p class="action-text">{action}</p>
           </div>
@@ -239,8 +239,8 @@ def _render_action_plan(gaps: list[dict]) -> str:
 
     return f"""
     <section class="report-section action-plan">
-      <h2 class="section-heading">Plan de acción</h2>
-      <p class="section-lead">Gaps ordenados por riesgo al paciente. Acciones correctivas sugeridas.</p>
+      <h2 class="section-heading">Action Plan</h2>
+      <p class="section-lead">Gaps ordered by patient risk. Suggested corrective actions.</p>
       <ol class="action-list">{"".join(items)}</ol>
     </section>"""
 
@@ -249,12 +249,12 @@ def _render_validated_section(validated_controls: list[dict]) -> str:
     if not validated_controls:
         return """
     <section class="report-section validated-section">
-      <h2 class="section-heading">Evidencia validada</h2>
+      <h2 class="section-heading">Validated Evidence</h2>
       <p class="section-lead">
-        Cada control validado tiene evidencia verificable en el código.
-        La IA propone; solo la evidencia determinística certifica.
+        Every validated control has verifiable evidence in the code.
+        AI proposes; only deterministic evidence certifies.
       </p>
-      <p class="section-empty">No hay controles con evidencia validada en esta evaluación.</p>
+      <p class="section-empty">No controls with validated evidence in this evaluation.</p>
     </section>"""
 
     items = []
@@ -285,10 +285,10 @@ def _render_validated_section(validated_controls: list[dict]) -> str:
 
     return f"""
     <section class="report-section validated-section">
-      <h2 class="section-heading">Evidencia validada</h2>
+      <h2 class="section-heading">Validated Evidence</h2>
       <p class="section-lead">
-        Cada control validado tiene evidencia verificable en el código.
-        La IA propone; solo la evidencia determinística certifica.
+        Every validated control has verifiable evidence in the code.
+        AI proposes; only deterministic evidence certifies.
       </p>
       <div class="evidence-list">{"".join(items)}</div>
     </section>"""
@@ -306,14 +306,14 @@ def _render_domain_table(metrics: dict) -> str:
           <td class="num status-gap">{stats["gaps"]}</td>
         </tr>""")
     if not domain_rows:
-        return "<p class='section-empty'>Sin controles evaluados.</p>"
+        return "<p class='section-empty'>No controls evaluated.</p>"
     return f"""
     <table class="tech-table domain-table">
       <thead>
         <tr>
-          <th>Dominio HITRUST</th>
-          <th>Evaluados</th>
-          <th>Validados</th>
+          <th>HITRUST Domain</th>
+          <th>Evaluated</th>
+          <th>Validated</th>
           <th>Gaps</th>
         </tr>
       </thead>
@@ -335,14 +335,14 @@ def _render_normative_refs(controls: list[dict]) -> str:
           <td class="refs-cell">{refs_html}</td>
         </tr>""")
     if not rows:
-        return "<p class='section-empty'>Sin referencias normativas registradas.</p>"
+        return "<p class='section-empty'>No normative references recorded.</p>"
     return f"""
     <table class="tech-table refs-table">
       <thead>
         <tr>
           <th>Control</th>
-          <th>Requisito</th>
-          <th>Referencias normativas</th>
+          <th>Requirement</th>
+          <th>Normative references</th>
         </tr>
       </thead>
       <tbody>{"".join(rows)}</tbody>
@@ -351,7 +351,7 @@ def _render_normative_refs(controls: list[dict]) -> str:
 
 def _render_skipped_files(skipped: list[dict]) -> str:
     if not skipped:
-        return "<p class='scope-empty'>Ningún archivo omitido del escaneo.</p>"
+        return "<p class='scope-empty'>No files skipped during scan.</p>"
     rows = []
     for entry in skipped:
         path = html.escape(str(entry.get("path", "—")))
@@ -359,7 +359,7 @@ def _render_skipped_files(skipped: list[dict]) -> str:
         rows.append(f"<tr><td class='mono'>{path}</td><td>{reason}</td></tr>")
     return f"""
     <table class="tech-table scope-table">
-      <thead><tr><th>Archivo</th><th>Motivo</th></tr></thead>
+      <thead><tr><th>File</th><th>Reason</th></tr></thead>
       <tbody>{"".join(rows)}</tbody>
     </table>"""
 
@@ -381,22 +381,22 @@ def _render_technical_detail(
 
     return f"""
     <details class="technical-details">
-      <summary class="technical-summary">Detalle técnico</summary>
+      <summary class="technical-summary">Technical detail</summary>
       <div class="technical-body">
         <div class="tech-block">
-          <h3 class="tech-heading">Métricas de cobertura</h3>
+          <h3 class="tech-heading">Coverage metrics</h3>
           <div class="tech-metrics">
             <div class="tech-metric">
-              <span class="tech-metric-value">{total} de {E1_TOTAL_CONTROL_REFS}</span>
-              <span class="tech-metric-label">Cobertura e1</span>
+              <span class="tech-metric-value">{total} of {E1_TOTAL_CONTROL_REFS}</span>
+              <span class="tech-metric-label">e1 coverage</span>
             </div>
             <div class="tech-metric">
               <span class="tech-metric-value">{metrics["avg_prisma"]:.1f}%</span>
-              <span class="tech-metric-label">Madurez PRISMA promedio</span>
+              <span class="tech-metric-label">Average PRISMA maturity</span>
             </div>
             <div class="tech-metric">
               <span class="tech-metric-value">{metrics["verifiable_findings"]}</span>
-              <span class="tech-metric-label">Hallazgos con file:line</span>
+              <span class="tech-metric-label">Findings with file:line</span>
             </div>
             <div class="tech-metric">
               <span class="tech-metric-value status-gap">{metrics["gap_count"]}</span>
@@ -404,22 +404,22 @@ def _render_technical_detail(
             </div>
           </div>
           <p class="tech-note">
-            {total} de {E1_TOTAL_CONTROL_REFS} control references del assessment e1 evaluadas.
+            {total} of {E1_TOTAL_CONTROL_REFS} e1 assessment control references evaluated.
           </p>
         </div>
 
         <div class="tech-block">
-          <h3 class="tech-heading">Distribución por dominio HITRUST</h3>
+          <h3 class="tech-heading">Distribution by HITRUST domain</h3>
           {domain_table}
         </div>
 
         <div class="tech-block">
-          <h3 class="tech-heading">Madurez PRISMA</h3>
+          <h3 class="tech-heading">PRISMA Maturity</h3>
           {prisma_html}
         </div>
 
         <div class="tech-block">
-          <h3 class="tech-heading">Referencias normativas</h3>
+          <h3 class="tech-heading">Normative references</h3>
           {refs_table}
         </div>
 
@@ -429,22 +429,22 @@ def _render_technical_detail(
         </div>
 
         <div class="tech-block">
-          <h3 class="tech-heading">Alcance del escaneo</h3>
+          <h3 class="tech-heading">Scan scope</h3>
           <div class="scope-grid">
             <div class="scope-stat">
-              <div class="scope-stat-label">Repositorio</div>
+              <div class="scope-stat-label">Repository</div>
               <div class="scope-stat-value mono">{repo_path}</div>
             </div>
             <div class="scope-stat">
-              <div class="scope-stat-label">Archivos escaneados</div>
+              <div class="scope-stat-label">Files scanned</div>
               <div class="scope-stat-value">{files_scanned}</div>
             </div>
             <div class="scope-stat">
-              <div class="scope-stat-label">Archivos omitidos</div>
+              <div class="scope-stat-label">Skipped files</div>
               <div class="scope-stat-value">{len(skipped_files)}</div>
             </div>
           </div>
-          <div class="scope-subheading">Archivos omitidos</div>
+          <div class="scope-subheading">Skipped files</div>
           {skipped_html}
         </div>
       </div>
@@ -481,37 +481,37 @@ def _suggest_cap_action(ctrl: dict) -> str:
     name = (ctrl.get("name") or "").lower()
     if "audit" in name or "logging" in name:
         return (
-            "Implementar audit logging con user_id, timestamp y retención "
-            "en los módulos que tocan PHI."
+            "Implement audit logging with user_id, timestamp, and retention "
+            "in modules that handle PHI."
         )
     if "encrypt" in name or "protection" in name or "privacy" in name:
         return (
-            "Implementar cifrado en reposo y controles de protección de datos "
-            "para información cubierta (PHI)."
+            "Implement encryption at rest and data protection controls "
+            "for covered information (PHI)."
         )
     if "auth" in name or "identification" in name:
         return (
-            "Implementar autenticación robusta (MFA) y gestión de identidades "
-            "en puntos de acceso al sistema."
+            "Implement robust authentication (MFA) and identity management "
+            "at system access points."
         )
     if "session" in name or "timeout" in name:
         return (
-            "Configurar timeout de sesión e idle timeout en puntos de acceso "
-            "al sistema que procesan PHI."
+            "Configure session timeout and idle timeout at access points "
+            "to systems that process PHI."
         )
     if "backup" in name:
         return (
-            "Implementar backups automatizados con retención definida "
-            "para datos clínicos y bases de datos con PHI."
+            "Implement automated backups with defined retention "
+            "for clinical data and databases containing PHI."
         )
     if "retention" in name or "disposal" in name:
         return (
-            "Definir política de retención y disposición segura de datos "
-            "para registros clínicos y PHI."
+            "Define secure data retention and disposal policy "
+            "for clinical records and PHI."
         )
     return (
-        f"Implementar el control {ctrl.get('control_id', '')} según los requisitos "
-        "HITRUST CSF correspondientes, con evidencia verificable en código o infraestructura."
+        f"Implement control {ctrl.get('control_id', '')} per the corresponding "
+        "HITRUST CSF requirements, with verifiable evidence in code or infrastructure."
     )
 
 
@@ -544,24 +544,24 @@ def _render_prisma_maturity_section(controls: list[dict]) -> str:
     <tr>
       <td><strong>Not Implemented</strong></td>
       <td class="pct-cell">0%</td>
-      <td>Sin evidencia de implementación técnica detectada en código o infraestructura.</td>
+      <td>No technical implementation evidence detected in code or infrastructure.</td>
       <td class="controls-cell">{not_impl_html}</td>
     </tr>""")
 
     return f"""
     <p class="section-intro">
-      El modelo PRISMA de HITRUST define cinco niveles de madurez de control.
-      Este motor analiza implementación en código e infraestructura; por ello,
-      la mayoría de los controles evaluados alcanzan <strong>Implemented (50%)</strong>
-      cuando hay evidencia validada, o <strong>Not Implemented (0%)</strong> cuando se detecta un gap.
+      The HITRUST PRISMA model defines five control maturity levels.
+      This engine analyzes implementation in code and infrastructure; therefore,
+      most evaluated controls reach <strong>Implemented (50%)</strong>
+      when validated evidence exists, or <strong>Not Implemented (0%)</strong> when a gap is detected.
     </p>
     <table class="prisma-table">
       <thead>
         <tr>
-          <th>Nivel PRISMA</th>
+          <th>PRISMA Level</th>
           <th>%</th>
-          <th>Descripción</th>
-          <th>Controles en este nivel</th>
+          <th>Description</th>
+          <th>Controls at this level</th>
         </tr>
       </thead>
       <tbody>{"".join(level_rows)}</tbody>
@@ -572,8 +572,8 @@ def _render_caps_section(gaps: list[dict]) -> str:
     if not gaps:
         return """
     <p class="section-intro caps-clear">
-      No se identificaron gaps. Todos los controles evaluados tienen evidencia
-      de implementación validada.
+      No gaps identified. All evaluated controls have validated
+      implementation evidence.
     </p>"""
     rows = []
     for ctrl in gaps:
@@ -588,16 +588,16 @@ def _render_caps_section(gaps: list[dict]) -> str:
         </tr>""")
     return f"""
     <p class="section-intro">
-      Cada gap identificado se documenta como Corrective Action Plan (CAP)
-      con el nivel de madurez evaluado y una acción correctiva sugerida.
+      Each identified gap is documented as a Corrective Action Plan (CAP)
+      with the assessed maturity level and a suggested corrective action.
     </p>
     <table class="caps-table">
       <thead>
         <tr>
           <th>Control</th>
-          <th>Requisito</th>
-          <th>Madurez evaluada</th>
-          <th>Acción correctiva sugerida</th>
+          <th>Requirement</th>
+          <th>Assessed maturity</th>
+          <th>Suggested corrective action</th>
         </tr>
       </thead>
       <tbody>{"".join(rows)}</tbody>
@@ -659,7 +659,7 @@ def _render_report_html(job_id: str, job: dict) -> str:
     )
 
     return f"""<!DOCTYPE html>
-<html lang="es">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -802,7 +802,7 @@ def _render_report_html(job_id: str, job: dict) -> str:
       font-style: italic;
     }}
 
-    /* —— Plan de acción —— */
+    /* —— Action Plan —— */
     .action-list {{
       list-style: none;
       counter-reset: action;
@@ -855,7 +855,7 @@ def _render_report_html(job_id: str, job: dict) -> str:
       line-height: 1.6;
     }}
 
-    /* —— Evidencia validada —— */
+    /* —— Validated Evidence —— */
     .evidence-list {{
       display: flex;
       flex-direction: column;
@@ -897,7 +897,7 @@ def _render_report_html(job_id: str, job: dict) -> str:
       word-break: break-word;
     }}
 
-    /* —— NIVEL 4: Detalle técnico (colapsable) —— */
+    /* —— LEVEL 4: Technical detail (collapsible) —— */
     .technical-details {{
       margin-top: 16px;
       margin-bottom: 32px;
@@ -1101,12 +1101,12 @@ def _render_report_html(job_id: str, job: dict) -> str:
     {technical_html}
 
     <footer class="footer-note">
-      <strong>Aviso legal:</strong>
-      Este reporte fue generado automáticamente por el motor de análisis SaMD
-      y no sustituye una evaluación formal realizada por un External Assessor
-      certificado de HITRUST. Los resultados reflejan evidencia detectada en
-      código e infraestructura; la certificación oficial requiere revisión
-      humana por un assessor acreditado.
+      <strong>Legal notice:</strong>
+      This report was generated automatically by the SaMD analysis engine
+      and does not replace a formal assessment by a certified HITRUST
+      External Assessor. Results reflect evidence detected in code and
+      infrastructure; official certification requires human review by an
+      accredited assessor.
     </footer>
   </div>
 </body>

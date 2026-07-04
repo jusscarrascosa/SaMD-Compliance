@@ -230,7 +230,7 @@ def validate_encryption_at_rest_terraform(repo: Path) -> dict | None:
         _ENCRYPTION_TF_PATTERNS,
         _TF_EXTENSIONS,
         "config_check",
-        lambda h: f"cifrado en reposo detectado en infra ({h['label']})",
+        lambda h: f"encryption at rest detected in infra ({h['label']})",
     )
 
 
@@ -241,7 +241,7 @@ def validate_encryption_at_rest_python(repo: Path) -> dict | None:
         _ENCRYPTION_CODE_PATTERNS,
         _APP_CODE_EXTENSIONS,
         "code_check",
-        lambda h: f"cifrado a nivel aplicación detectado ({h['label']})",
+        lambda h: f"application-level encryption detected ({h['label']})",
         line_skip=_is_encryption_false_positive,
         path_skip=_is_test_file,
     )
@@ -287,7 +287,7 @@ def validate_mfa(repo: Path) -> dict | None:
         _MFA_PATTERNS,
         CODE_CONFIG_EXTENSIONS,
         "config_check",
-        lambda h: f"MFA detectado ({h['label']})",
+        lambda h: f"MFA detected ({h['label']})",
         line_skip=_is_mfa_false_positive,
         path_skip=_is_test_file,
     )
@@ -345,10 +345,10 @@ _AUDIT_SUB_REQ_PATTERNS: dict[str, re.Pattern[str]] = {
 }
 
 _AUDIT_SUB_REQ_LABELS = {
-    "user_identifier": "identificador de usuario",
-    "timestamp": "timestamp / fecha-hora",
-    "action": "función o acción realizada",
-    "retention_policy": "política de retención",
+    "user_identifier": "user identifier",
+    "timestamp": "timestamp / date-time",
+    "action": "function or action performed",
+    "retention_policy": "retention policy",
 }
 
 _ESSENTIAL_AUDIT_FIELDS = ("user_identifier", "timestamp", "action")
@@ -455,13 +455,13 @@ def validate_audit_logging_python(repo: Path) -> dict | None:
     primary = logging_locations[0]
     if validation_status == "satisfied":
         detail = (
-            "logging con campos esenciales (usuario, timestamp, acción); "
-            f"sub-requisitos cumplidos: {', '.join(met_labels)}"
+            "logging with essential fields (user, timestamp, action); "
+            f"sub-requirements met: {', '.join(met_labels)}"
         )
     else:
         detail = (
-            "logging detectado pero incompleto; "
-            f"faltan esenciales: {', '.join(missing_essential)}"
+            "logging detected but incomplete; "
+            f"missing essentials: {', '.join(missing_essential)}"
         )
 
     return {
@@ -548,7 +548,7 @@ def validate_backup_terraform(repo: Path) -> dict | None:
         _BACKUP_TF_PATTERNS,
         _TF_EXTENSIONS,
         "infra_check",
-        lambda h: f"configuración de backup en infra ({h['label']})",
+        lambda h: f"backup configuration in infra ({h['label']})",
         line_skip=_is_backup_false_positive,
     )
 
@@ -560,7 +560,7 @@ def validate_backup_code(repo: Path) -> dict | None:
         _BACKUP_CODE_PATTERNS,
         CODE_CONFIG_EXTENSIONS,
         "config_check",
-        lambda h: f"backup programado detectado ({h['label']})",
+        lambda h: f"scheduled backup detected ({h['label']})",
         line_skip=lambda line: _is_dump_false_positive(line) or _is_backup_false_positive(line),
         path_skip=_is_test_file,
     )
@@ -605,7 +605,7 @@ def validate_session_timeout(repo: Path) -> dict | None:
         _SESSION_TIMEOUT_PATTERNS,
         CODE_CONFIG_EXTENSIONS,
         "config_check",
-        lambda h: f"control de sesión detectado ({h['label']})",
+        lambda h: f"session control detected ({h['label']})",
         line_skip=_is_session_timeout_false_positive,
         path_skip=lambda p, r: _is_test_file(p, r) or _is_example_or_docs_file(p, r),
     )
@@ -662,7 +662,7 @@ def validate_data_retention_code(repo: Path) -> dict | None:
         _DATA_RETENTION_PATTERNS,
         _RETENTION_CODE_EXTENSIONS,
         "config_check",
-        lambda h: f"retención/disposición de datos detectada ({h['label']})",
+        lambda h: f"data retention/disposal detected ({h['label']})",
         line_skip=_is_data_retention_false_positive,
         path_skip=lambda p, r: _is_test_file(p, r) or _is_example_or_docs_file(p, r),
     )
@@ -675,7 +675,7 @@ def validate_data_retention_terraform(repo: Path) -> dict | None:
         _RETENTION_TF_PATTERNS,
         _TF_EXTENSIONS,
         "infra_check",
-        lambda h: f"retención de datos en infra ({h['label']})",
+        lambda h: f"data retention in infra ({h['label']})",
         line_skip=_is_data_retention_false_positive,
     )
 
@@ -700,7 +700,7 @@ CONTROL_REGISTRY = {
         "fallback_validator": validate_encryption_at_rest_python,
         "fallback_source": {
             "id": "python_code",
-            "label": "Código de aplicación (cryptography, AES, encrypt/decrypt)",
+            "label": "Application code (cryptography, AES, encrypt/decrypt)",
         },
         "clinical_proximity": "data_storage",
     },
@@ -725,7 +725,7 @@ CONTROL_REGISTRY = {
         "primary_validator": validate_audit_logging_python,
         "primary_source": {
             "id": "python_code",
-            "label": "Código (audit_log, logging)",
+            "label": "Code (audit_log, logging)",
         },
         "fallback_validator": validate_audit_logging_terraform,
         "fallback_source": {
@@ -750,7 +750,7 @@ CONTROL_REGISTRY = {
         "fallback_validator": validate_backup_code,
         "fallback_source": {
             "id": "code_config",
-            "label": "Código/config (pg_dump, backup programado)",
+            "label": "Code/config (pg_dump, scheduled backup)",
         },
         "clinical_proximity": "data_storage",
     },
@@ -774,7 +774,7 @@ CONTROL_REGISTRY = {
         "primary_validator": validate_data_retention_code,
         "primary_source": {
             "id": "code_config",
-            "label": "Código/config (retention_period, purge, delete_after, disposal)",
+            "label": "Code/config (retention_period, purge, delete_after, disposal)",
         },
         "fallback_validator": validate_data_retention_terraform,
         "fallback_source": {
