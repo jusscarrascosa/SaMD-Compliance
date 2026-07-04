@@ -9,6 +9,104 @@ import re
 from pathlib import Path
 from typing import Iterator, Literal
 
+# Errores de lectura que no deben abortar el análisis completo.
+READ_ERRORS = (FileNotFoundError, PermissionError, UnicodeDecodeError, OSError)
+
+_skipped_files: list[dict] | None = None
+
+
+def begin_file_scan() -> list[dict]:
+    """Inicia un escaneo; devuelve la lista compartida de archivos omitidos."""
+    global _skipped_files
+    _skipped_files = []
+    return _skipped_files
+
+
+def get_skipped_files() -> list[dict]:
+    """Archivos que no pudieron leerse durante el escaneo actual."""
+    return list(_skipped_files or [])
+
+
+def _record_skipped(path: Path, repo: Path | None, exc: BaseException) -> None:
+    if _skipped_files is None:
+        return
+    entry: dict = {
+        "path": str(path.relative_to(repo)) if repo else str(path),
+        "error": type(exc).__name__,
+        "message": str(exc),
+    }
+    _skipped_files.append(entry)
+
+
+def safe_read_text(path: Path, repo: Path | None = None) -> str | None:
+    """Lee un archivo de texto; None si no se puede leer (sin abortar)."""
+    try:
+        return path.read_text(errors="ignore")
+    except READ_ERRORS as exc:
+        _record_skipped(path, repo, exc)
+        return None
+
+
+def is_declaration_file(path: Path) -> bool:
+    """Archivos .d.ts: definiciones de tipos, no implementación."""
+    return path.name.lower().endswith(".d.ts")
+
+
+def effective_code_line(line: str, in_block_comment: bool) -> tuple[str, bool]:
+    """Código ejecutable de una línea; omite //, #, /* */ y bloques multilínea."""
+    if in_block_comment:
+        end_idx = line.find("*/")
+        if end_idx == -1:
+            return "", True
+        line = line[end_idx + 2 :]
+        in_block_comment = False
+        if not line.strip():
+            return "", False
+
+    result: list[str] = []
+    i = 0
+    n = len(line)
+    in_single = in_double = False
+
+    while i < n:
+        ch = line[i]
+        if in_single:
+            result.append(ch)
+            if ch == "'" and (i == 0 or line[i - 1] != "\\"):
+                in_single = False
+            i += 1
+            continue
+        if in_double:
+            result.append(ch)
+            if ch == '"' and (i == 0 or line[i - 1] != "\\"):
+                in_double = False
+            i += 1
+            continue
+        if ch == "'":
+            in_single = True
+            result.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            in_double = True
+            result.append(ch)
+            i += 1
+            continue
+        if ch == "#":
+            break
+        if line[i : i + 2] == "//":
+            break
+        if line[i : i + 2] == "/*":
+            end_idx = line.find("*/", i + 2)
+            if end_idx == -1:
+                return "".join(result).rstrip(), True
+            i = end_idx + 2
+            continue
+        result.append(ch)
+        i += 1
+
+    return "".join(result).rstrip(), in_block_comment
+
 # Carpetas de dependencias, build y VCS que no aportan señal de compliance.
 SKIP_DIRS = frozenset({
     "node_modules",
@@ -157,22 +255,47 @@ def iter_repo_files(
 ) -> Iterator[Path]:
     """Recorre solo archivos de código/config, omitiendo carpetas irrelevantes."""
     ext_filter = extensions or CODE_CONFIG_EXTENSIONS
-    for dirpath, dirnames, filenames in os.walk(repo):
-        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
+    try:
+        walk = os.walk(repo)
+    except OSError as exc:
+        _record_skipped(repo, None, exc)
+        return
+
+    for dirpath, dirnames, filenames in walk:
+        try:
+            dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
+        except OSError:
+            continue
         for name in filenames:
             path = Path(dirpath) / name
-            if path.suffix.lower() in ext_filter:
-                yield path
+            try:
+                if path.suffix.lower() not in ext_filter:
+                    continue
+                # Excluye symlinks rotos, directorios y entradas que desaparecieron.
+                if not path.is_file():
+                    continue
+            except OSError as exc:
+                _record_skipped(path, repo, exc)
+                continue
+            yield path
 
 
 def find_pattern_in_text(
     text: str,
     patterns: list[tuple[re.Pattern[str], str]],
+    *,
+    skip_comments: bool = True,
 ) -> dict | None:
     """Primera coincidencia con número de línea exacto. None si no hay match."""
+    in_block = False
     for line_no, line in enumerate(text.splitlines(), start=1):
+        search_line = line
+        if skip_comments:
+            search_line, in_block = effective_code_line(line, in_block)
+            if not search_line.strip():
+                continue
         for pattern, label in patterns:
-            if pattern.search(line):
+            if pattern.search(search_line):
                 return {
                     "line": line_no,
                     "match": line.strip(),
@@ -184,15 +307,26 @@ def find_pattern_in_text(
 def find_all_pattern_hits(
     text: str,
     patterns: list[tuple[re.Pattern[str], str]],
+    *,
+    skip_comments: bool = True,
+    max_line_length: int = 2000,
 ) -> list[dict]:
     """Todas las coincidencias con archivo/línea (para validadores multi-hit)."""
     hits: list[dict] = []
+    in_block = False
     for line_no, line in enumerate(text.splitlines(), start=1):
+        if len(line) > max_line_length:
+            continue
+        search_line = line
+        if skip_comments:
+            search_line, in_block = effective_code_line(line, in_block)
+            if not search_line.strip() or len(search_line) > max_line_length:
+                continue
         for pattern, label in patterns:
-            if pattern.search(line):
+            if pattern.search(search_line):
                 hits.append({
                     "line": line_no,
-                    "match": line.strip(),
+                    "match": line.strip()[:200],
                     "label": label,
                 })
     return hits
@@ -203,7 +337,9 @@ def build_inventory(repo: Path) -> dict:
     Marca módulos que tocan PHI y los que participan en decisiones clínicas."""
     modules = []
     for f in iter_repo_files(repo):
-        text = f.read_text(errors="ignore")
+        text = safe_read_text(f, repo)
+        if text is None:
+            continue
         low = text.lower()
         modules.append({
             "path": str(f.relative_to(repo)),
@@ -217,6 +353,7 @@ def build_inventory(repo: Path) -> dict:
         "modules": modules,
         "phi_modules": [m["path"] for m in modules if m["touches_phi"]],
         "clinical_modules": [m["path"] for m in modules if m["clinical_decision"]],
+        "skipped_files": get_skipped_files(),
     }
 
 

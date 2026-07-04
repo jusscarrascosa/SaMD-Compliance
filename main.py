@@ -3,9 +3,12 @@ API FastAPI. Async: POST encola, GET consulta.
 Superficie mínima del §7.2 de tu doc + evidence trail + audit log.
 """
 from __future__ import annotations
+import html
 import uuid, asyncio
 from datetime import datetime, timezone
+from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
@@ -36,9 +39,1078 @@ async def _worker(job_id: str, target: str):
     JOBS[job_id]["status"] = "running"
     try:
         result = await asyncio.to_thread(run_analysis, target)
-        JOBS[job_id].update(status="completed", result=result)
+        JOBS[job_id].update(
+            status="completed",
+            result=result,
+            completed_at=datetime.now(timezone.utc).isoformat(),
+        )
     except Exception as e:
         JOBS[job_id].update(status="failed", error=str(e))
+
+
+PRISMA_LEVELS = [
+    ("Policy", 0, "Documentación de políticas de seguridad y privacidad."),
+    ("Procedure", 25, "Procedimientos operativos documentados y asignados."),
+    ("Implemented", 50, "Controles implementados técnicamente en el sistema."),
+    ("Measured", 75, "Controles medidos y monitoreados con métricas."),
+    ("Managed", 100, "Controles gestionados continuamente con mejora."),
+]
+
+E1_TOTAL_CONTROL_REFS = 44
+
+HITRUST_DOMAIN_NAMES: dict[str, str] = {
+    "01": "01 — Access Control",
+    "06": "06 — Data Protection",
+    "09": "09 — Operations",
+}
+
+_CAP_SUGGESTIONS: dict[str, str] = {
+    "HITRUST-06.d": (
+        "Implementar cifrado en reposo (KMS, storage_encrypted o equivalente) "
+        "para datos cubiertos en almacenamiento y bases de datos que contienen PHI."
+    ),
+    "HITRUST-01.q": (
+        "Implementar autenticación multifactor (MFA) y verificación de identidad "
+        "de usuario en los puntos de acceso a sistemas que procesan PHI."
+    ),
+    "HITRUST-09.aa": (
+        "Implementar audit logging con user_id, timestamp y retención "
+        "en los módulos que tocan PHI."
+    ),
+    "HITRUST-09.l": (
+        "Implementar backups automatizados con retención definida "
+        "(RDS snapshot, AWS Backup o pg_dump programado) para datos clínicos."
+    ),
+    "HITRUST-01.b": (
+        "Configurar timeout de sesión e idle timeout (p. ej. SESSION_TIMEOUT, "
+        "expires_in o maxAge de cookie) en puntos de acceso al sistema."
+    ),
+    "HITRUST-06.h": (
+        "Definir política de retención y disposición de datos (retention_period, "
+        "purge, delete_after) para registros clínicos y PHI."
+    ),
+}
+
+
+def _hitrust_domain_key(control_id: str) -> str:
+    """Extrae el prefijo de dominio HITRUST (ej. '06' de 'HITRUST-06.d')."""
+    if not control_id.startswith("HITRUST-"):
+        return "other"
+    ref = control_id[len("HITRUST-"):]
+    digits = ""
+    for ch in ref:
+        if ch.isdigit():
+            digits += ch
+        else:
+            break
+    return digits or "other"
+
+
+def _hitrust_domain_label(domain_key: str) -> str:
+    return HITRUST_DOMAIN_NAMES.get(
+        domain_key,
+        f"{domain_key} — Other" if domain_key != "other" else "Other",
+    )
+
+
+def _has_verifiable_evidence(ctrl: dict) -> bool:
+    evidence = ctrl.get("evidence") or {}
+    return bool(evidence.get("file") and evidence.get("line"))
+
+
+def _compute_report_metrics(controls: list[dict]) -> dict:
+    total = len(controls)
+    validated = sum(
+        1 for c in controls
+        if c.get("confidence") == "validated" and c.get("status") == "satisfied"
+    )
+    gaps = [c for c in controls if c.get("status") in ("gap", "partial")]
+    prisma_pcts = [_prisma_maturity(c)["pct"] for c in controls]
+    avg_prisma = round(sum(prisma_pcts) / total, 1) if total else 0.0
+    compliance_score = round((validated / total) * 100, 1) if total else 0.0
+    verifiable_findings = sum(1 for c in controls if _has_verifiable_evidence(c))
+
+    domain_stats: dict[str, dict[str, int]] = {}
+    for ctrl in controls:
+        key = _hitrust_domain_key(ctrl.get("control_id", ""))
+        if key not in domain_stats:
+            domain_stats[key] = {"validated": 0, "gaps": 0, "total": 0}
+        domain_stats[key]["total"] += 1
+        if ctrl.get("confidence") == "validated" and ctrl.get("status") == "satisfied":
+            domain_stats[key]["validated"] += 1
+        elif ctrl.get("status") in ("gap", "partial"):
+            domain_stats[key]["gaps"] += 1
+
+    return {
+        "total": total,
+        "validated": validated,
+        "gap_count": len(gaps),
+        "compliance_score": compliance_score,
+        "avg_prisma": avg_prisma,
+        "verifiable_findings": verifiable_findings,
+        "domain_stats": domain_stats,
+    }
+
+
+def _format_control_id(control_id: str) -> str:
+    return control_id.removeprefix("HITRUST-")
+
+
+def _control_display_name(ctrl: dict) -> str:
+    """Nombre para UI: el campo name ya incluye el prefijo (ej. '06.h Data Retention…')."""
+    name = (ctrl.get("name") or "").strip()
+    if name:
+        return name
+    return _format_control_id(ctrl.get("control_id", ""))
+
+
+def _readiness_from_score(score: float) -> tuple[str, str]:
+    if score >= 75:
+        return "Alta", "readiness-high"
+    if score >= 40:
+        return "Parcial", "readiness-partial"
+    return "Baja", "readiness-low"
+
+
+def _render_verdict_section(
+    compliance_score: float,
+    validated: int,
+    total: int,
+    top_gap: dict | None,
+) -> str:
+    score_display = f"{compliance_score:.0f}%"
+    readiness_label, readiness_cls = _readiness_from_score(compliance_score)
+
+    if top_gap:
+        gap_label = html.escape(_control_display_name(top_gap))
+        gap_score = top_gap.get("patient_risk_score", 0)
+        critical_html = f"""
+      <p class="verdict-critical">
+        Prioridad crítica: <strong>{gap_label}</strong>
+        — riesgo al paciente {gap_score:.1f}
+      </p>"""
+    else:
+        critical_html = """
+      <p class="verdict-critical verdict-clear">
+        Sin gaps críticos detectados en los controles evaluados.
+      </p>"""
+
+    return f"""
+    <section class="verdict" aria-label="Veredicto de compliance">
+      <div class="verdict-main">
+        <div class="verdict-score-block">
+          <div class="verdict-score">{score_display}</div>
+          <div class="verdict-score-label">Compliance Score</div>
+          <div class="verdict-score-detail">{validated} de {total} controles validados</div>
+        </div>
+        <div class="verdict-readiness">
+          <span class="readiness-label">Readiness</span>
+          <span class="readiness-badge {readiness_cls}">{readiness_label}</span>
+        </div>
+      </div>
+      {critical_html}
+    </section>"""
+
+
+def _render_action_plan(gaps: list[dict]) -> str:
+    if not gaps:
+        return """
+    <section class="report-section action-plan">
+      <h2 class="section-heading">Plan de acción</h2>
+      <p class="section-empty">No se identificaron gaps. Todos los controles evaluados tienen evidencia validada.</p>
+    </section>"""
+
+    items = []
+    for rank, ctrl in enumerate(gaps, start=1):
+        label = html.escape(_control_display_name(ctrl))
+        score = ctrl.get("patient_risk_score", 0)
+        action = html.escape(_suggest_cap_action(ctrl))
+        items.append(f"""
+        <li class="action-item">
+          <span class="action-rank">{rank}</span>
+          <div class="action-body">
+            <div class="action-title">
+              <span class="action-name">{label}</span>
+              <span class="risk-score">riesgo {score:.1f}</span>
+            </div>
+            <p class="action-text">{action}</p>
+          </div>
+        </li>""")
+
+    return f"""
+    <section class="report-section action-plan">
+      <h2 class="section-heading">Plan de acción</h2>
+      <p class="section-lead">Gaps ordenados por riesgo al paciente. Acciones correctivas sugeridas.</p>
+      <ol class="action-list">{"".join(items)}</ol>
+    </section>"""
+
+
+def _render_validated_section(validated_controls: list[dict]) -> str:
+    if not validated_controls:
+        return """
+    <section class="report-section validated-section">
+      <h2 class="section-heading">Evidencia validada</h2>
+      <p class="section-lead">
+        Cada control validado tiene evidencia verificable en el código.
+        La IA propone; solo la evidencia determinística certifica.
+      </p>
+      <p class="section-empty">No hay controles con evidencia validada en esta evaluación.</p>
+    </section>"""
+
+    items = []
+    for ctrl in validated_controls:
+        label = html.escape(_control_display_name(ctrl))
+        evidence = ctrl.get("evidence") or {}
+        file_line = "—"
+        match_text = ""
+        if evidence.get("file") and evidence.get("line"):
+            file_line = html.escape(f"{evidence['file']}:{evidence['line']}")
+            match_text = evidence.get("match", "")
+        elif evidence.get("source"):
+            file_line = html.escape(str(evidence["source"]))
+
+        match_html = (
+            f"<pre class='evidence-match'>{html.escape(match_text)}</pre>"
+            if match_text
+            else ""
+        )
+        items.append(f"""
+        <article class="evidence-item">
+          <div class="evidence-header">
+            <h3 class="evidence-name">{label}</h3>
+          </div>
+          <div class="evidence-loc">{file_line}</div>
+          {match_html}
+        </article>""")
+
+    return f"""
+    <section class="report-section validated-section">
+      <h2 class="section-heading">Evidencia validada</h2>
+      <p class="section-lead">
+        Cada control validado tiene evidencia verificable en el código.
+        La IA propone; solo la evidencia determinística certifica.
+      </p>
+      <div class="evidence-list">{"".join(items)}</div>
+    </section>"""
+
+
+def _render_domain_table(metrics: dict) -> str:
+    domain_rows = []
+    for key in sorted(metrics["domain_stats"].keys()):
+        stats = metrics["domain_stats"][key]
+        domain_rows.append(f"""
+        <tr>
+          <td>{html.escape(_hitrust_domain_label(key))}</td>
+          <td class="num">{stats["total"]}</td>
+          <td class="num status-validated">{stats["validated"]}</td>
+          <td class="num status-gap">{stats["gaps"]}</td>
+        </tr>""")
+    if not domain_rows:
+        return "<p class='section-empty'>Sin controles evaluados.</p>"
+    return f"""
+    <table class="tech-table domain-table">
+      <thead>
+        <tr>
+          <th>Dominio HITRUST</th>
+          <th>Evaluados</th>
+          <th>Validados</th>
+          <th>Gaps</th>
+        </tr>
+      </thead>
+      <tbody>{"".join(domain_rows)}</tbody>
+    </table>"""
+
+
+def _render_normative_refs(controls: list[dict]) -> str:
+    rows = []
+    for ctrl in controls:
+        refs = ctrl.get("framework_refs", [])
+        if not refs:
+            continue
+        refs_html = ", ".join(html.escape(r) for r in refs)
+        rows.append(f"""
+        <tr>
+          <td class="mono">{html.escape(_format_control_id(ctrl.get("control_id", "")))}</td>
+          <td>{html.escape(ctrl.get("name", ""))}</td>
+          <td class="refs-cell">{refs_html}</td>
+        </tr>""")
+    if not rows:
+        return "<p class='section-empty'>Sin referencias normativas registradas.</p>"
+    return f"""
+    <table class="tech-table refs-table">
+      <thead>
+        <tr>
+          <th>Control</th>
+          <th>Requisito</th>
+          <th>Referencias normativas</th>
+        </tr>
+      </thead>
+      <tbody>{"".join(rows)}</tbody>
+    </table>"""
+
+
+def _render_skipped_files(skipped: list[dict]) -> str:
+    if not skipped:
+        return "<p class='scope-empty'>Ningún archivo omitido del escaneo.</p>"
+    rows = []
+    for entry in skipped:
+        path = html.escape(str(entry.get("path", "—")))
+        reason = html.escape(str(entry.get("reason", entry.get("detail", entry.get("message", "—")))))
+        rows.append(f"<tr><td class='mono'>{path}</td><td>{reason}</td></tr>")
+    return f"""
+    <table class="tech-table scope-table">
+      <thead><tr><th>Archivo</th><th>Motivo</th></tr></thead>
+      <tbody>{"".join(rows)}</tbody>
+    </table>"""
+
+
+def _render_technical_detail(
+    metrics: dict,
+    controls: list[dict],
+    gaps: list[dict],
+    repo_path: str,
+    files_scanned: int,
+    skipped_files: list[dict],
+    prisma_html: str,
+    caps_html: str,
+) -> str:
+    total = metrics["total"]
+    domain_table = _render_domain_table(metrics)
+    refs_table = _render_normative_refs(controls)
+    skipped_html = _render_skipped_files(skipped_files)
+
+    return f"""
+    <details class="technical-details">
+      <summary class="technical-summary">Detalle técnico</summary>
+      <div class="technical-body">
+        <div class="tech-block">
+          <h3 class="tech-heading">Métricas de cobertura</h3>
+          <div class="tech-metrics">
+            <div class="tech-metric">
+              <span class="tech-metric-value">{total} de {E1_TOTAL_CONTROL_REFS}</span>
+              <span class="tech-metric-label">Cobertura e1</span>
+            </div>
+            <div class="tech-metric">
+              <span class="tech-metric-value">{metrics["avg_prisma"]:.1f}%</span>
+              <span class="tech-metric-label">Madurez PRISMA promedio</span>
+            </div>
+            <div class="tech-metric">
+              <span class="tech-metric-value">{metrics["verifiable_findings"]}</span>
+              <span class="tech-metric-label">Hallazgos con file:line</span>
+            </div>
+            <div class="tech-metric">
+              <span class="tech-metric-value status-gap">{metrics["gap_count"]}</span>
+              <span class="tech-metric-label">Gaps (CAP)</span>
+            </div>
+          </div>
+          <p class="tech-note">
+            {total} de {E1_TOTAL_CONTROL_REFS} control references del assessment e1 evaluadas.
+          </p>
+        </div>
+
+        <div class="tech-block">
+          <h3 class="tech-heading">Distribución por dominio HITRUST</h3>
+          {domain_table}
+        </div>
+
+        <div class="tech-block">
+          <h3 class="tech-heading">Madurez PRISMA</h3>
+          {prisma_html}
+        </div>
+
+        <div class="tech-block">
+          <h3 class="tech-heading">Referencias normativas</h3>
+          {refs_table}
+        </div>
+
+        <div class="tech-block">
+          <h3 class="tech-heading">Corrective Action Plans (CAPs)</h3>
+          {caps_html}
+        </div>
+
+        <div class="tech-block">
+          <h3 class="tech-heading">Alcance del escaneo</h3>
+          <div class="scope-grid">
+            <div class="scope-stat">
+              <div class="scope-stat-label">Repositorio</div>
+              <div class="scope-stat-value mono">{repo_path}</div>
+            </div>
+            <div class="scope-stat">
+              <div class="scope-stat-label">Archivos escaneados</div>
+              <div class="scope-stat-value">{files_scanned}</div>
+            </div>
+            <div class="scope-stat">
+              <div class="scope-stat-label">Archivos omitidos</div>
+              <div class="scope-stat-value">{len(skipped_files)}</div>
+            </div>
+          </div>
+          <div class="scope-subheading">Archivos omitidos</div>
+          {skipped_html}
+        </div>
+      </div>
+    </details>"""
+
+
+def _prisma_maturity(ctrl: dict) -> dict:
+    """Mapea validated/gap a terminología PRISMA y porcentaje de madurez."""
+    is_validated = (
+        ctrl.get("confidence") == "validated"
+        and ctrl.get("status") == "satisfied"
+    )
+    if is_validated:
+        return {
+            "level": "Implemented",
+            "pct": 50,
+            "label": "Implemented (50%)",
+            "css": "prisma-implemented",
+            "bar_class": "prisma-bar-implemented",
+        }
+    return {
+        "level": "Not Implemented",
+        "pct": 0,
+        "label": "Not Implemented (0%)",
+        "css": "prisma-none",
+        "bar_class": "prisma-bar-none",
+    }
+
+
+def _suggest_cap_action(ctrl: dict) -> str:
+    control_id = ctrl.get("control_id", "")
+    if control_id in _CAP_SUGGESTIONS:
+        return _CAP_SUGGESTIONS[control_id]
+    name = (ctrl.get("name") or "").lower()
+    if "audit" in name or "logging" in name:
+        return (
+            "Implementar audit logging con user_id, timestamp y retención "
+            "en los módulos que tocan PHI."
+        )
+    if "encrypt" in name or "protection" in name or "privacy" in name:
+        return (
+            "Implementar cifrado en reposo y controles de protección de datos "
+            "para información cubierta (PHI)."
+        )
+    if "auth" in name or "identification" in name:
+        return (
+            "Implementar autenticación robusta (MFA) y gestión de identidades "
+            "en puntos de acceso al sistema."
+        )
+    if "session" in name or "timeout" in name:
+        return (
+            "Configurar timeout de sesión e idle timeout en puntos de acceso "
+            "al sistema que procesan PHI."
+        )
+    if "backup" in name:
+        return (
+            "Implementar backups automatizados con retención definida "
+            "para datos clínicos y bases de datos con PHI."
+        )
+    if "retention" in name or "disposal" in name:
+        return (
+            "Definir política de retención y disposición segura de datos "
+            "para registros clínicos y PHI."
+        )
+    return (
+        f"Implementar el control {ctrl.get('control_id', '')} según los requisitos "
+        "HITRUST CSF correspondientes, con evidencia verificable en código o infraestructura."
+    )
+
+
+def _render_prisma_maturity_section(controls: list[dict]) -> str:
+    level_rows = []
+    for level_name, pct, description in PRISMA_LEVELS:
+        if level_name == "Implemented":
+            at_level = [
+                c for c in controls
+                if _prisma_maturity(c)["level"] == "Implemented"
+            ]
+        else:
+            at_level = []
+        controls_html = ", ".join(
+            html.escape(_format_control_id(c.get("control_id", ""))) for c in at_level
+        ) or "—"
+        level_rows.append(f"""
+        <tr>
+          <td><strong>{html.escape(level_name)}</strong></td>
+          <td class="pct-cell">{pct}%</td>
+          <td>{html.escape(description)}</td>
+          <td class="controls-cell">{controls_html}</td>
+        </tr>""")
+
+    not_impl = [c for c in controls if _prisma_maturity(c)["level"] == "Not Implemented"]
+    not_impl_html = ", ".join(
+        html.escape(_format_control_id(c.get("control_id", ""))) for c in not_impl
+    ) or "—"
+    level_rows.append(f"""
+    <tr>
+      <td><strong>Not Implemented</strong></td>
+      <td class="pct-cell">0%</td>
+      <td>Sin evidencia de implementación técnica detectada en código o infraestructura.</td>
+      <td class="controls-cell">{not_impl_html}</td>
+    </tr>""")
+
+    return f"""
+    <p class="section-intro">
+      El modelo PRISMA de HITRUST define cinco niveles de madurez de control.
+      Este motor analiza implementación en código e infraestructura; por ello,
+      la mayoría de los controles evaluados alcanzan <strong>Implemented (50%)</strong>
+      cuando hay evidencia validada, o <strong>Not Implemented (0%)</strong> cuando se detecta un gap.
+    </p>
+    <table class="prisma-table">
+      <thead>
+        <tr>
+          <th>Nivel PRISMA</th>
+          <th>%</th>
+          <th>Descripción</th>
+          <th>Controles en este nivel</th>
+        </tr>
+      </thead>
+      <tbody>{"".join(level_rows)}</tbody>
+    </table>"""
+
+
+def _render_caps_section(gaps: list[dict]) -> str:
+    if not gaps:
+        return """
+    <p class="section-intro caps-clear">
+      No se identificaron gaps. Todos los controles evaluados tienen evidencia
+      de implementación validada.
+    </p>"""
+    rows = []
+    for ctrl in gaps:
+        prisma = _prisma_maturity(ctrl)
+        action = _suggest_cap_action(ctrl)
+        rows.append(f"""
+        <tr>
+          <td class="mono">{html.escape(_format_control_id(ctrl.get("control_id", "")))}</td>
+          <td>{html.escape(ctrl.get("name", ""))}</td>
+          <td><span class="status-label prisma-label {prisma['css']}">{html.escape(prisma['label'])}</span></td>
+          <td>{html.escape(action)}</td>
+        </tr>""")
+    return f"""
+    <p class="section-intro">
+      Cada gap identificado se documenta como Corrective Action Plan (CAP)
+      con el nivel de madurez evaluado y una acción correctiva sugerida.
+    </p>
+    <table class="caps-table">
+      <thead>
+        <tr>
+          <th>Control</th>
+          <th>Requisito</th>
+          <th>Madurez evaluada</th>
+          <th>Acción correctiva sugerida</th>
+        </tr>
+      </thead>
+      <tbody>{"".join(rows)}</tbody>
+    </table>"""
+
+
+def _render_report_html(job_id: str, job: dict) -> str:
+    result = job["result"]
+    repo = result.get("repo", "—")
+    repo_name = html.escape(Path(repo).name or repo)
+    repo_path = html.escape(repo)
+
+    completed = job.get("completed_at")
+    if completed:
+        try:
+            dt = datetime.fromisoformat(completed)
+            date_str = dt.strftime("%d %b %Y, %H:%M UTC")
+        except ValueError:
+            date_str = html.escape(completed)
+    else:
+        date_str = datetime.now(timezone.utc).strftime("%d %b %Y, %H:%M UTC")
+
+    inventory = result.get("inventory_summary", {})
+    files_scanned = inventory.get("files", 0)
+    skipped_files = inventory.get("skipped_files", [])
+
+    controls = sorted(
+        result.get("controls", []),
+        key=lambda c: c.get("patient_risk_score", 0),
+        reverse=True,
+    )
+    validated_controls = [
+        c for c in controls
+        if c.get("confidence") == "validated" and c.get("status") == "satisfied"
+    ]
+    gaps = [c for c in controls if c.get("status") in ("gap", "partial")]
+    top_gap = max(gaps, key=lambda c: c.get("patient_risk_score", 0)) if gaps else None
+
+    metrics = _compute_report_metrics(controls)
+    verdict_html = _render_verdict_section(
+        metrics["compliance_score"],
+        metrics["validated"],
+        metrics["total"],
+        top_gap,
+    )
+    action_html = _render_action_plan(gaps)
+    validated_html = _render_validated_section(validated_controls)
+    prisma_html = _render_prisma_maturity_section(controls)
+    caps_html = _render_caps_section(gaps)
+    technical_html = _render_technical_detail(
+        metrics,
+        controls,
+        gaps,
+        repo_path,
+        files_scanned,
+        skipped_files,
+        prisma_html,
+        caps_html,
+    )
+
+    return f"""<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HITRUST CSF Assessment Report — {repo_name}</title>
+  <style>
+    *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{
+      font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+      font-size: 14px;
+      line-height: 1.55;
+      color: #1a1a1a;
+      background: #fff;
+    }}
+    .page {{
+      max-width: 880px;
+      margin: 0 auto;
+      padding: 40px 40px 64px;
+    }}
+
+    /* —— Meta header (discreto) —— */
+    .report-meta {{
+      margin-bottom: 32px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid #e8e8e8;
+    }}
+    .report-meta .repo-name {{
+      font-family: Georgia, "Times New Roman", Times, serif;
+      font-size: 1rem;
+      color: #1e3a5f;
+      margin-bottom: 4px;
+    }}
+    .report-meta .meta-line {{
+      font-size: 0.72rem;
+      color: #767676;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }}
+
+    /* —— NIVEL 1: Veredicto —— */
+    .verdict {{
+      margin-bottom: 56px;
+      padding-bottom: 40px;
+      border-bottom: 2px solid #1a1a1a;
+    }}
+    .verdict-main {{
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 32px;
+      margin-bottom: 28px;
+    }}
+    .verdict-score {{
+      font-family: Georgia, "Times New Roman", Times, serif;
+      font-size: 5.5rem;
+      font-weight: 400;
+      line-height: 1;
+      color: #1a1a1a;
+      letter-spacing: -0.02em;
+    }}
+    .verdict-score-label {{
+      font-size: 0.7rem;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: #767676;
+      margin-top: 10px;
+    }}
+    .verdict-score-detail {{
+      font-size: 1.05rem;
+      color: #4a4a4a;
+      margin-top: 6px;
+    }}
+    .verdict-readiness {{
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 8px;
+      flex-shrink: 0;
+    }}
+    .readiness-label {{
+      font-size: 0.65rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #767676;
+    }}
+    .readiness-badge {{
+      font-size: 1.35rem;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      padding: 6px 16px;
+      border: 2px solid;
+    }}
+    .readiness-high {{
+      color: #2d6a4f;
+      border-color: #2d6a4f;
+    }}
+    .readiness-partial {{
+      color: #1e3a5f;
+      border-color: #1e3a5f;
+    }}
+    .readiness-low {{
+      color: #9b2226;
+      border-color: #9b2226;
+    }}
+    .verdict-critical {{
+      font-size: 1.05rem;
+      color: #1a1a1a;
+      line-height: 1.5;
+      padding: 14px 18px;
+      background: #fafafa;
+      border-left: 4px solid #9b2226;
+    }}
+    .verdict-critical strong {{ font-weight: 600; }}
+    .verdict-critical.verdict-clear {{
+      border-left-color: #2d6a4f;
+      color: #4a4a4a;
+    }}
+
+    /* —— NIVEL 2–3: Secciones principales —— */
+    .report-section {{
+      margin-bottom: 52px;
+      page-break-inside: avoid;
+    }}
+    .section-heading {{
+      font-family: Georgia, "Times New Roman", Times, serif;
+      font-size: 1.35rem;
+      font-weight: 400;
+      color: #1a1a1a;
+      margin-bottom: 12px;
+    }}
+    .section-lead {{
+      font-size: 0.9rem;
+      color: #4a4a4a;
+      margin-bottom: 24px;
+      line-height: 1.65;
+      max-width: 640px;
+    }}
+    .section-empty {{
+      font-size: 0.85rem;
+      color: #767676;
+      font-style: italic;
+    }}
+
+    /* —— Plan de acción —— */
+    .action-list {{
+      list-style: none;
+      counter-reset: action;
+    }}
+    .action-item {{
+      display: flex;
+      gap: 16px;
+      padding: 18px 0;
+      border-bottom: 1px solid #e8e8e8;
+    }}
+    .action-item:first-child {{
+      border-top: 2px solid #1a1a1a;
+    }}
+    .action-rank {{
+      font-family: Georgia, "Times New Roman", Times, serif;
+      font-size: 1.5rem;
+      color: #9b2226;
+      min-width: 28px;
+      line-height: 1.2;
+      flex-shrink: 0;
+    }}
+    .action-title {{
+      display: flex;
+      flex-wrap: wrap;
+      align-items: baseline;
+      gap: 8px 12px;
+      margin-bottom: 6px;
+    }}
+    .control-id {{
+      font-family: ui-monospace, "Cascadia Code", monospace;
+      font-size: 0.75rem;
+      color: #767676;
+    }}
+    .action-name {{
+      font-size: 1rem;
+      font-weight: 600;
+      color: #1a1a1a;
+    }}
+    .risk-score {{
+      font-size: 0.75rem;
+      font-variant-numeric: tabular-nums;
+      color: #9b2226;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }}
+    .action-text {{
+      font-size: 0.88rem;
+      color: #4a4a4a;
+      line-height: 1.6;
+    }}
+
+    /* —— Evidencia validada —— */
+    .evidence-list {{
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+    }}
+    .evidence-item {{
+      padding: 20px 0;
+      border-bottom: 1px solid #e8e8e8;
+    }}
+    .evidence-item:first-child {{
+      border-top: 1px solid #d0d0d0;
+    }}
+    .evidence-header {{
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+      margin-bottom: 8px;
+    }}
+    .evidence-name {{
+      font-family: Georgia, "Times New Roman", Times, serif;
+      font-size: 1rem;
+      font-weight: 400;
+      color: #1a1a1a;
+    }}
+    .evidence-loc {{
+      font-family: ui-monospace, "Cascadia Code", monospace;
+      font-size: 0.82rem;
+      color: #1e3a5f;
+    }}
+    .evidence-match {{
+      margin-top: 8px;
+      padding: 10px 12px;
+      background: #f5f5f5;
+      border: 1px solid #e8e8e8;
+      font-family: ui-monospace, "Cascadia Code", monospace;
+      font-size: 0.75rem;
+      overflow-x: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }}
+
+    /* —— NIVEL 4: Detalle técnico (colapsable) —— */
+    .technical-details {{
+      margin-top: 16px;
+      margin-bottom: 32px;
+      border: 1px solid #d0d0d0;
+    }}
+    .technical-summary {{
+      font-size: 0.8rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+      color: #4a4a4a;
+      padding: 14px 18px;
+      cursor: pointer;
+      list-style: none;
+      background: #fafafa;
+    }}
+    .technical-summary::-webkit-details-marker {{ display: none; }}
+    .technical-summary::before {{
+      content: "▸ ";
+      color: #767676;
+    }}
+    .technical-details[open] .technical-summary::before {{
+      content: "▾ ";
+    }}
+    .technical-body {{
+      padding: 24px 18px 8px;
+      font-size: 0.82rem;
+      color: #4a4a4a;
+    }}
+    .tech-block {{
+      margin-bottom: 32px;
+    }}
+    .tech-block:last-child {{ margin-bottom: 8px; }}
+    .tech-heading {{
+      font-size: 0.72rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: #767676;
+      margin-bottom: 14px;
+      padding-bottom: 6px;
+      border-bottom: 1px solid #e8e8e8;
+    }}
+    .tech-metrics {{
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 16px;
+      margin-bottom: 12px;
+    }}
+    .tech-metric {{
+      text-align: center;
+    }}
+    .tech-metric-value {{
+      display: block;
+      font-size: 1.1rem;
+      color: #1a1a1a;
+      font-variant-numeric: tabular-nums;
+    }}
+    .tech-metric-label {{
+      display: block;
+      font-size: 0.62rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: #767676;
+      margin-top: 4px;
+    }}
+    .tech-note {{
+      font-size: 0.78rem;
+      color: #767676;
+      line-height: 1.5;
+    }}
+    .tech-table, .prisma-table, .caps-table {{
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.8rem;
+    }}
+    .tech-table th, .prisma-table th, .caps-table th {{
+      text-align: left;
+      padding: 7px 10px;
+      border-bottom: 1px solid #1a1a1a;
+      font-size: 0.62rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: #767676;
+      font-weight: 600;
+    }}
+    .tech-table td, .prisma-table td, .caps-table td {{
+      padding: 8px 10px;
+      border-bottom: 1px solid #e8e8e8;
+      vertical-align: top;
+      color: #4a4a4a;
+    }}
+    .tech-table .num {{
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }}
+    .prisma-table .pct-cell {{ font-variant-numeric: tabular-nums; white-space: nowrap; }}
+    .prisma-table .controls-cell, .refs-cell {{
+      font-family: ui-monospace, monospace;
+      font-size: 0.75rem;
+    }}
+    .mono {{ font-family: ui-monospace, monospace; font-size: 0.8rem; }}
+    .status-validated {{ color: #2d6a4f; }}
+    .status-gap {{ color: #9b2226; }}
+    .status-label {{
+      font-size: 0.65rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }}
+    .status-label.prisma-implemented {{ color: #1e3a5f; }}
+    .status-label.prisma-none {{ color: #9b2226; }}
+    .section-intro {{
+      font-size: 0.78rem;
+      color: #767676;
+      margin-bottom: 14px;
+      line-height: 1.6;
+    }}
+    .scope-grid {{
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 16px;
+      margin-bottom: 20px;
+    }}
+    .scope-stat-label {{
+      font-size: 0.62rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: #767676;
+      margin-bottom: 4px;
+    }}
+    .scope-stat-value {{
+      font-size: 0.82rem;
+      color: #4a4a4a;
+      word-break: break-all;
+    }}
+    .scope-stat-value.mono {{
+      font-family: ui-monospace, monospace;
+      font-size: 0.75rem;
+    }}
+    .scope-subheading {{
+      font-size: 0.62rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: #767676;
+      margin: 8px 0 10px;
+    }}
+    .scope-empty {{
+      font-size: 0.78rem;
+      color: #767676;
+      font-style: italic;
+    }}
+
+    /* —— Footer —— */
+    .footer-note {{
+      margin-top: 8px;
+      padding-top: 20px;
+      border-top: 1px solid #d0d0d0;
+      font-size: 0.78rem;
+      color: #767676;
+      line-height: 1.65;
+    }}
+    .footer-note strong {{
+      font-family: Georgia, "Times New Roman", Times, serif;
+      font-weight: 400;
+      color: #1a1a1a;
+    }}
+
+    @media (max-width: 720px) {{
+      .page {{ padding: 24px 20px 48px; }}
+      .verdict-main {{ flex-direction: column; align-items: flex-start; }}
+      .verdict-readiness {{ align-items: flex-start; }}
+      .verdict-score {{ font-size: 4rem; }}
+      .tech-metrics {{ grid-template-columns: repeat(2, 1fr); }}
+      .scope-grid {{ grid-template-columns: 1fr; }}
+    }}
+    @media print {{
+      body {{ background: #fff; }}
+      .page {{ padding: 0; max-width: 100%; }}
+      .technical-details {{ border: none; }}
+      .technical-details[open] summary {{ display: none; }}
+      .technical-body {{ padding: 0; }}
+      .action-item, .evidence-item {{ break-inside: avoid; }}
+    }}
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header class="report-meta">
+      <div class="repo-name">{repo_name}</div>
+      <div class="meta-line">HITRUST CSF · e1 subset · {date_str} · ID {html.escape(job_id[:8])}…</div>
+    </header>
+
+    {verdict_html}
+
+    {action_html}
+
+    {validated_html}
+
+    {technical_html}
+
+    <footer class="footer-note">
+      <strong>Aviso legal:</strong>
+      Este reporte fue generado automáticamente por el motor de análisis SaMD
+      y no sustituye una evaluación formal realizada por un External Assessor
+      certificado de HITRUST. Los resultados reflejan evidencia detectada en
+      código e infraestructura; la certificación oficial requiere revisión
+      humana por un assessor acreditado.
+    </footer>
+  </div>
+</body>
+</html>"""
 
 
 @app.post("/v1/analyses", status_code=202)
@@ -71,6 +1143,16 @@ async def get_gaps(job_id: str):
     if not job or job["status"] != "completed":
         raise HTTPException(409, "not ready")
     return {"gaps": job["result"]["gaps"]}  # ordenados por patient_risk_score
+
+
+@app.get("/v1/analyses/{job_id}/report", response_class=HTMLResponse)
+async def get_report(job_id: str, request: Request):
+    """Reporte visual HTML del análisis — para revisión en navegador o impresión a PDF."""
+    job = JOBS.get(job_id)
+    if not job or job["status"] != "completed":
+        raise HTTPException(409, "not ready")
+    _audit("report.read", request, analysis_id=job_id)
+    return HTMLResponse(_render_report_html(job_id, job))
 
 
 @app.get("/v1/analyses/{job_id}/summary")

@@ -13,7 +13,7 @@ from pathlib import Path
 from openai import OpenAI
 
 from validators import CONTROL_REGISTRY
-from analysis import build_inventory, patient_risk_score
+from analysis import begin_file_scan, build_inventory, get_skipped_files, patient_risk_score
 
 # Cliente apuntando a Vultr Serverless Inference (compatible OpenAI)
 client = OpenAI(
@@ -78,6 +78,7 @@ def _llm(system: str, user: str) -> str:
 
 def run_analysis(repo_path: str) -> dict:
     repo = Path(repo_path)
+    begin_file_scan()
 
     # --- PASO 1: el agente PLANIFICA (LLM) ---
     inventory = build_inventory(repo)
@@ -163,6 +164,7 @@ def run_analysis(repo_path: str) -> dict:
             "files": inventory["file_count"],
             "phi_modules": inventory["phi_modules"],
             "clinical_modules": inventory["clinical_modules"],
+            "skipped_files": get_skipped_files(),
         },
         "controls": results,
         "gaps": [r for r in results if r["status"] in ("gap", "partial")],
