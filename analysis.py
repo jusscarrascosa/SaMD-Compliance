@@ -4,8 +4,45 @@ Deep Compliance Analysis: parsea el repo y construye un inventario
 Traducción del DCA de Apiiro: entender qué maneja cada módulo.
 """
 from __future__ import annotations
+import os
+import re
 from pathlib import Path
-from typing import Literal
+from typing import Iterator, Literal
+
+# Carpetas de dependencias, build y VCS que no aportan señal de compliance.
+SKIP_DIRS = frozenset({
+    "node_modules",
+    ".git",
+    "dist",
+    "build",
+    "vendor",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+    "coverage",
+    ".next",
+    ".nuxt",
+    "target",
+    ".cache",
+    ".turbo",
+})
+
+# Solo archivos de código y configuración — sin binarios ni assets.
+CODE_CONFIG_EXTENSIONS = frozenset({
+    ".py",
+    ".ts",
+    ".tsx",
+    ".js",
+    ".jsx",
+    ".tf",
+    ".tfvars",
+    ".yaml",
+    ".yml",
+    ".json",
+})
 
 # Niveles de cumplimiento alcanzado, alineados con el CSF de HITRUST.
 # Referencia: HITRUST CSF v11.8, sección "Implementation Requirement Levels"
@@ -114,20 +151,65 @@ _COMPLIANCE_RISK_FACTOR: dict[ComplianceLevel, float] = {
 _PHI_WEIGHT = {"touches": 1.0, "no_phi": 0.5}
 
 
+def iter_repo_files(
+    repo: Path,
+    extensions: frozenset[str] | None = None,
+) -> Iterator[Path]:
+    """Recorre solo archivos de código/config, omitiendo carpetas irrelevantes."""
+    ext_filter = extensions or CODE_CONFIG_EXTENSIONS
+    for dirpath, dirnames, filenames in os.walk(repo):
+        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
+        for name in filenames:
+            path = Path(dirpath) / name
+            if path.suffix.lower() in ext_filter:
+                yield path
+
+
+def find_pattern_in_text(
+    text: str,
+    patterns: list[tuple[re.Pattern[str], str]],
+) -> dict | None:
+    """Primera coincidencia con número de línea exacto. None si no hay match."""
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        for pattern, label in patterns:
+            if pattern.search(line):
+                return {
+                    "line": line_no,
+                    "match": line.strip(),
+                    "label": label,
+                }
+    return None
+
+
+def find_all_pattern_hits(
+    text: str,
+    patterns: list[tuple[re.Pattern[str], str]],
+) -> list[dict]:
+    """Todas las coincidencias con archivo/línea (para validadores multi-hit)."""
+    hits: list[dict] = []
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        for pattern, label in patterns:
+            if pattern.search(line):
+                hits.append({
+                    "line": line_no,
+                    "match": line.strip(),
+                    "label": label,
+                })
+    return hits
+
+
 def build_inventory(repo: Path) -> dict:
     """Recorre el repo y arma un mapa módulo -> propiedades.
     Marca módulos que tocan PHI y los que participan en decisiones clínicas."""
     modules = []
-    for f in repo.rglob("*"):
-        if not f.is_file():
-            continue
+    for f in iter_repo_files(repo):
         text = f.read_text(errors="ignore")
         low = text.lower()
         modules.append({
             "path": str(f.relative_to(repo)),
             "touches_phi": any(k in low for k in ["phi", "patient", "diagnosis", "clinical", "lab result"]),
             "clinical_decision": any(k in low for k in ["diagnos", "decision", "evaluate_patient"]),
-            "is_infra": f.suffix == ".tf",
+            "is_infra": f.suffix.lower() in (".tf", ".tfvars"),
         })
     return {
         "root": str(repo),
