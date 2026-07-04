@@ -73,6 +73,47 @@ async def get_gaps(job_id: str):
     return {"gaps": job["result"]["gaps"]}  # ordenados por patient_risk_score
 
 
+@app.get("/v1/analyses/{job_id}/summary")
+async def get_summary(job_id: str):
+    """Resumen ejecutivo para demo: conteos, gap crítico y frase de una línea."""
+    job = JOBS.get(job_id)
+    if not job or job["status"] != "completed":
+        raise HTTPException(409, "not ready")
+
+    controls = job["result"]["controls"]
+    total = len(controls)
+    validated = sum(1 for c in controls if c["confidence"] == "validated")
+    proposed = sum(1 for c in controls if c["confidence"] == "proposed")
+    gaps = [c for c in controls if c["status"] in ("gap", "partial")]
+
+    top_gap = None
+    if gaps:
+        top = max(gaps, key=lambda c: c["patient_risk_score"])
+        top_gap = {
+            "control_id": top["control_id"],
+            "name": top["name"],
+            "patient_risk_score": top["patient_risk_score"],
+        }
+
+    if top_gap:
+        headline = (
+            f"{validated} de {total} controles certificados; "
+            f"gap crítico: {top_gap['name']}"
+        )
+    else:
+        headline = f"{validated} de {total} controles certificados; sin gaps críticos"
+
+    return {
+        "analysis_id": job_id,
+        "total_controls": total,
+        "validated": validated,
+        "proposed": proposed,
+        "gaps": len(gaps),
+        "top_gap": top_gap,
+        "headline": headline,
+    }
+
+
 @app.get("/v1/analyses/{job_id}/evidence/{control_id}")
 async def get_evidence(job_id: str, control_id: str, request: Request):
     """El evidence file de un control — lo que el auditor HITRUST querrá ver.
