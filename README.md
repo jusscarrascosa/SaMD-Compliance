@@ -79,6 +79,8 @@ flowchart TB
 
 Interactive OpenAPI docs: [http://localhost:8000/docs](http://localhost:8000/docs)
 
+> **Note:** These URLs are local — they work when you run the server yourself with `uvicorn`. See [Quickstart](#quickstart) below. There is no hosted demo; you must start the API on your machine to use them.
+
 ---
 
 ## Quickstart
@@ -119,6 +121,8 @@ uvicorn main:app --reload
 
 ### 4. Run an analysis
 
+All examples below use `http://localhost:8000` — your local server from step 3. Replace `{analysis_id}` with the ID returned by the POST request.
+
 **With curl:**
 
 ```bash
@@ -144,7 +148,7 @@ chmod +x analizar.sh
 ./analizar.sh sample_repo
 ```
 
-The script submits the job, polls until completion, saves controls to `{repo_name}.json`, and prints the report URL.
+The script submits the job, polls until completion, saves controls to `{repo_name}.json`, and prints a local report URL (e.g. `http://localhost:8000/v1/analyses/.../report`) that opens only while your server is running.
 
 ---
 
