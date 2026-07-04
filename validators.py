@@ -14,11 +14,10 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def validate_encryption_at_rest(repo: Path) -> dict | None:
-    """HITRUST 06.d / HIPAA 164.312(a)(2)(iv): cifrado de PHI en reposo.
-    Evidencia real: un recurso de storage con storage_encrypted = true."""
+def validate_encryption_at_rest_terraform(repo: Path) -> dict | None:
+    """HITRUST 06.d — fuente primaria: infra Terraform (storage_encrypted, KMS)."""
     for tf in repo.rglob("*.tf"):
-        text = tf.read_text()
+        text = tf.read_text(errors="ignore")
         if re.search(r"storage_encrypted\s*=\s*true", text):
             kms = bool(re.search(r"kms_key_id", text))
             return {
@@ -28,6 +27,32 @@ def validate_encryption_at_rest(repo: Path) -> dict | None:
                 "verified_at": _now(),
             }
     return None
+
+
+def validate_encryption_at_rest_python(repo: Path) -> dict | None:
+    """HITRUST 06.d — fuente alternativa: cifrado a nivel aplicación en Python."""
+    patterns = [
+        (r"Fernet\s*\(", "Fernet (cryptography)"),
+        (r"AES\.new\s*\(", "AES"),
+        (r"\.encrypt\s*\(", "encrypt()"),
+        (r"encryption_key|ENCRYPTION_KEY", "encryption_key"),
+        (r"from cryptography", "cryptography library"),
+    ]
+    for py in repo.rglob("*.py"):
+        text = py.read_text(errors="ignore")
+        for pat, label in patterns:
+            if re.search(pat, text, re.IGNORECASE):
+                return {
+                    "type": "code_check",
+                    "source": str(py.relative_to(repo)),
+                    "detail": f"cifrado a nivel aplicación detectado ({label})",
+                    "verified_at": _now(),
+                }
+    return None
+
+
+# Alias retrocompatible
+validate_encryption_at_rest = validate_encryption_at_rest_terraform
 
 
 def validate_mfa(repo: Path) -> dict | None:
@@ -97,9 +122,8 @@ def _scan_audit_sub_requirements(text: str) -> dict[str, dict]:
     return breakdown
 
 
-def validate_audit_logging(repo: Path) -> dict | None:
-    """HITRUST 09.aa / HIPAA 164.312(b): registro de auditoría de acceso a PHI.
-    Evidencia real: logging con campos exigidos por el Nivel 1 del control.
+def validate_audit_logging_python(repo: Path) -> dict | None:
+    """HITRUST 09.aa — fuente primaria: audit logging en código Python.
     None -> sin logging (GAP). validation_status 'partial' -> logging incompleto."""
     logging_hits: list[str] = []
     audit_text_parts: list[str] = []
@@ -154,6 +178,30 @@ def validate_audit_logging(repo: Path) -> dict | None:
     }
 
 
+def validate_audit_logging_terraform(repo: Path) -> dict | None:
+    """HITRUST 09.aa — fuente alternativa: logging de infra en Terraform."""
+    infra_patterns = [
+        (r'resource\s+"aws_cloudtrail"', "AWS CloudTrail"),
+        (r'resource\s+"aws_cloudwatch_log_group"', "CloudWatch Log Group"),
+        (r"enable_logging\s*=\s*true", "enable_logging=true"),
+    ]
+    for tf in repo.rglob("*.tf"):
+        text = tf.read_text(errors="ignore")
+        hits = [label for pat, label in infra_patterns if re.search(pat, text, re.IGNORECASE)]
+        if hits:
+            return {
+                "type": "infra_check",
+                "source": str(tf.relative_to(repo)),
+                "detail": f"audit logging infra: {', '.join(hits)}",
+                "verified_at": _now(),
+            }
+    return None
+
+
+# Alias retrocompatible
+validate_audit_logging = validate_audit_logging_python
+
+
 # Registro: control_id -> (framework refs, validador, proximidad clínica)
 CONTROL_REGISTRY = {
     "HITRUST-06.d": {
@@ -165,7 +213,17 @@ CONTROL_REGISTRY = {
             "IEC-62304-5.1",
             "ISO-27001-A.8.24",
         ],
-        "validator": validate_encryption_at_rest,
+        "validator": validate_encryption_at_rest_terraform,
+        "primary_validator": validate_encryption_at_rest_terraform,
+        "primary_source": {
+            "id": "terraform",
+            "label": "Infra Terraform (storage_encrypted, KMS)",
+        },
+        "fallback_validator": validate_encryption_at_rest_python,
+        "fallback_source": {
+            "id": "python_code",
+            "label": "Código Python (cifrado en aplicación)",
+        },
         "clinical_proximity": "data_storage",
     },
     "HITRUST-01.q": {
@@ -185,7 +243,17 @@ CONTROL_REGISTRY = {
             "IEC-62304-5.1",
             "ISO-14971-clause7",
         ],
-        "validator": validate_audit_logging,
+        "validator": validate_audit_logging_python,
+        "primary_validator": validate_audit_logging_python,
+        "primary_source": {
+            "id": "python_code",
+            "label": "Código Python (audit_log, logging)",
+        },
+        "fallback_validator": validate_audit_logging_terraform,
+        "fallback_source": {
+            "id": "terraform",
+            "label": "Terraform (CloudTrail, aws_cloudwatch_log_group)",
+        },
         "clinical_proximity": "diagnostic_decision",
     },
 }

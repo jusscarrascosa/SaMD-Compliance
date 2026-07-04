@@ -23,6 +23,49 @@ client = OpenAI(
 MODEL = os.environ.get("VULTR_MODEL", "llama-3.3-70b-instruct")
 
 
+def _step_result(evidence: dict | None) -> str:
+    """Etiqueta legible del resultado de una recuperación."""
+    if evidence is None:
+        return "not_found"
+    if evidence.get("validation_status") == "partial":
+        return "partial"
+    return "found"
+
+
+def _retrieve_with_fallback(repo: Path, spec: dict) -> tuple[dict | None, list[dict]]:
+    """Recuperación multi-paso: fuente primaria, y si devuelve None, fuente alternativa."""
+    retrieval_steps: list[dict] = []
+
+    primary_fn = spec.get("primary_validator") or spec["validator"]
+    primary_src = spec.get("primary_source", {"id": "primary", "label": "fuente primaria"})
+    evidence = primary_fn(repo)
+    step1: dict = {
+        "step": 1,
+        "source": primary_src["id"],
+        "description": primary_src["label"],
+        "result": _step_result(evidence),
+    }
+    if evidence:
+        step1["evidence_source"] = evidence.get("source")
+    retrieval_steps.append(step1)
+
+    if evidence is None and "fallback_validator" in spec:
+        fallback_fn = spec["fallback_validator"]
+        fallback_src = spec["fallback_source"]
+        evidence = fallback_fn(repo)
+        step2: dict = {
+            "step": 2,
+            "source": fallback_src["id"],
+            "description": fallback_src["label"],
+            "result": _step_result(evidence),
+        }
+        if evidence:
+            step2["evidence_source"] = evidence.get("source")
+        retrieval_steps.append(step2)
+
+    return evidence, retrieval_steps
+
+
 def _llm(system: str, user: str) -> str:
     resp = client.chat.completions.create(
         model=MODEL,
@@ -69,8 +112,8 @@ def run_analysis(repo_path: str) -> dict:
         except Exception:
             proposal = "propuesta no disponible"
 
-        # --- PASO 3: el VALIDADOR DETERMINÍSTICO decide (SIN LLM) ---
-        evidence = spec["validator"](repo)
+        # --- PASO 3: recuperación multi-paso + VALIDADOR DETERMINÍSTICO (SIN LLM) ---
+        evidence, retrieval_steps = _retrieve_with_fallback(repo, spec)
         validation_status = (evidence or {}).get("validation_status")
         if evidence is None:
             status = "gap"
@@ -106,6 +149,7 @@ def run_analysis(repo_path: str) -> dict:
             # LA LÍNEA CLAVE: proposed vs validated
             "confidence": confidence,
             "llm_proposal": proposal,
+            "retrieval_steps": retrieval_steps,
             "evidence": evidence,
             "clinical_proximity": spec["clinical_proximity"],
             "compliance_level": compliance_level,

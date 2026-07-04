@@ -95,6 +95,7 @@ async def get_evidence(job_id: str, control_id: str, request: Request):
         "confidence": ctrl["confidence"],          # proposed | validated
         "llm_proposal": ctrl["llm_proposal"],      # lo que la IA afirmó
         "evidence": ctrl["evidence"],              # la prueba verificable (o null)
+        "retrieval_steps": ctrl.get("retrieval_steps", []),
         "patient_risk_score": ctrl["patient_risk_score"],
         "clinical_proximity": ctrl["clinical_proximity"],
         "compliance_level": ctrl.get("compliance_level"),
