@@ -118,33 +118,84 @@ def _has_verifiable_evidence(ctrl: dict) -> bool:
     return bool(evidence.get("file") and evidence.get("line"))
 
 
+def _is_fully_validated(ctrl: dict) -> bool:
+    return (
+        ctrl.get("confidence") == "validated"
+        and ctrl.get("status") == "satisfied"
+    )
+
+
+def _is_partial(ctrl: dict) -> bool:
+    return ctrl.get("status") == "partial"
+
+
+def _is_gap(ctrl: dict) -> bool:
+    return ctrl.get("status") == "gap"
+
+
+def _partial_missing_labels(ctrl: dict) -> list[str]:
+    evidence = ctrl.get("evidence") or {}
+    missing = evidence.get("missing_essential")
+    if missing:
+        return list(missing)
+    summary = evidence.get("sub_requirements_summary") or {}
+    if summary.get("missing"):
+        return list(summary["missing"])
+    detail = evidence.get("detail", "")
+    if "missing essentials:" in detail:
+        return [part.strip() for part in detail.split("missing essentials:")[-1].split(",")]
+    return []
+
+
+def _partial_met_labels(ctrl: dict) -> list[str]:
+    evidence = ctrl.get("evidence") or {}
+    summary = evidence.get("sub_requirements_summary") or {}
+    if summary.get("met"):
+        return list(summary["met"])
+    sub_reqs = evidence.get("sub_requirements") or {}
+    return [info["label"] for info in sub_reqs.values() if info.get("met")]
+
+
+def _format_control_breakdown(validated: int, partial: int, gaps: int, total: int) -> str:
+    parts = [f"{validated} fully validated"]
+    if partial:
+        parts.append(f"{partial} partial")
+    if gaps:
+        parts.append(f"{gaps} gap{'s' if gaps != 1 else ''}")
+    return " · ".join(parts) + f" of {total}"
+
+
 def _compute_report_metrics(controls: list[dict]) -> dict:
     total = len(controls)
-    validated = sum(
-        1 for c in controls
-        if c.get("confidence") == "validated" and c.get("status") == "satisfied"
-    )
-    gaps = [c for c in controls if c.get("status") in ("gap", "partial")]
+    validated = sum(1 for c in controls if _is_fully_validated(c))
+    partial_count = sum(1 for c in controls if _is_partial(c))
+    gap_count = sum(1 for c in controls if _is_gap(c))
     prisma_pcts = [_prisma_maturity(c)["pct"] for c in controls]
     avg_prisma = round(sum(prisma_pcts) / total, 1) if total else 0.0
-    compliance_score = round((validated / total) * 100, 1) if total else 0.0
+    # Partial counts as half a validated control for the compliance score.
+    compliance_score = (
+        round(((validated + 0.5 * partial_count) / total) * 100, 1) if total else 0.0
+    )
     verifiable_findings = sum(1 for c in controls if _has_verifiable_evidence(c))
 
     domain_stats: dict[str, dict[str, int]] = {}
     for ctrl in controls:
         key = _hitrust_domain_key(ctrl.get("control_id", ""))
         if key not in domain_stats:
-            domain_stats[key] = {"validated": 0, "gaps": 0, "total": 0}
+            domain_stats[key] = {"validated": 0, "partial": 0, "gaps": 0, "total": 0}
         domain_stats[key]["total"] += 1
-        if ctrl.get("confidence") == "validated" and ctrl.get("status") == "satisfied":
+        if _is_fully_validated(ctrl):
             domain_stats[key]["validated"] += 1
-        elif ctrl.get("status") in ("gap", "partial"):
+        elif _is_partial(ctrl):
+            domain_stats[key]["partial"] += 1
+        elif _is_gap(ctrl):
             domain_stats[key]["gaps"] += 1
 
     return {
         "total": total,
         "validated": validated,
-        "gap_count": len(gaps),
+        "partial_count": partial_count,
+        "gap_count": gap_count,
         "compliance_score": compliance_score,
         "avg_prisma": avg_prisma,
         "verifiable_findings": verifiable_findings,
@@ -172,9 +223,31 @@ def _readiness_from_score(score: float) -> tuple[str, str]:
     return "Low", "readiness-low"
 
 
+def _cell_dash() -> str:
+    return '<span class="cell-dash" aria-hidden="true">—</span>'
+
+
+def _metric_zero_class(value: float | int) -> str:
+    return " metric-is-zero" if value == 0 else ""
+
+
+def _domain_num_cell(value: int, kind: str) -> str:
+    if value == 0:
+        return f'<td class="num num-zero">{value}</td>'
+    if kind == "validated":
+        return f'<td class="num status-validated">{value}</td>'
+    if kind == "partial":
+        return f'<td class="num status-partial">{value}</td>'
+    if kind == "gaps":
+        return f'<td class="num status-gap">{value}</td>'
+    return f'<td class="num">{value}</td>'
+
+
 def _render_verdict_section(
     compliance_score: float,
     validated: int,
+    partial_count: int,
+    gap_count: int,
     total: int,
     top_gap: dict | None,
 ) -> str:
@@ -195,13 +268,21 @@ def _render_verdict_section(
         No critical gaps detected in evaluated controls.
       </p>"""
 
+    breakdown = _format_control_breakdown(validated, partial_count, gap_count, total)
+    verdict_modifiers = []
+    if validated == 0 and partial_count == 0:
+        verdict_modifiers.append("verdict--all-gaps")
+    if compliance_score == 0:
+        verdict_modifiers.append("verdict--score-zero")
+    verdict_class = " ".join(verdict_modifiers)
+
     return f"""
-    <section class="verdict" aria-label="Compliance verdict">
+    <section class="verdict{' ' + verdict_class if verdict_class else ''}" aria-label="Compliance verdict">
       <div class="verdict-main">
         <div class="verdict-score-block">
           <div class="verdict-score">{score_display}</div>
           <div class="verdict-score-label">Compliance Score</div>
-          <div class="verdict-score-detail">{validated} of {total} controls validated</div>
+          <div class="verdict-score-detail">{breakdown}</div>
         </div>
         <div class="verdict-readiness">
           <span class="readiness-label">Readiness</span>
@@ -245,16 +326,106 @@ def _render_action_plan(gaps: list[dict]) -> str:
     </section>"""
 
 
-def _render_validated_section(validated_controls: list[dict]) -> str:
+def _render_partial_section(partial_controls: list[dict]) -> str:
+    if not partial_controls:
+        return ""
+
+    items = []
+    for ctrl in partial_controls:
+        label = html.escape(_control_display_name(ctrl))
+        evidence = ctrl.get("evidence") or {}
+        file_line = "—"
+        match_text = ""
+        if evidence.get("file") and evidence.get("line"):
+            file_line = html.escape(f"{evidence['file']}:{evidence['line']}")
+            match_text = evidence.get("match", "")
+        elif evidence.get("source"):
+            file_line = html.escape(str(evidence["source"]))
+
+        match_html = (
+            f"<pre class='evidence-match'>{html.escape(match_text)}</pre>"
+            if match_text
+            else ""
+        )
+        met = _partial_met_labels(ctrl)
+        missing = _partial_missing_labels(ctrl)
+        met_html = ""
+        if met:
+            met_items = "".join(f"<li>{html.escape(item)}</li>" for item in met)
+            met_html = f"""
+          <div class="partial-req partial-req--met">
+            <span class="partial-req-label">Found</span>
+            <ul class="partial-req-list">{met_items}</ul>
+          </div>"""
+        missing_html = ""
+        if missing:
+            missing_items = "".join(f"<li>{html.escape(item)}</li>" for item in missing)
+            missing_html = f"""
+          <div class="partial-req partial-req--missing">
+            <span class="partial-req-label">Missing</span>
+            <ul class="partial-req-list">{missing_items}</ul>
+          </div>"""
+        elif evidence.get("detail"):
+            missing_html = f"""
+          <div class="partial-req partial-req--missing">
+            <span class="partial-req-label">Gap detail</span>
+            <p class="partial-detail">{html.escape(str(evidence['detail']))}</p>
+          </div>"""
+        prisma = _prisma_maturity(ctrl)
+        items.append(f"""
+        <article class="evidence-item partial-item">
+          <div class="evidence-header">
+            <h3 class="evidence-name">{label}</h3>
+            <span class="status-badge status-badge-partial">Partial</span>
+          </div>
+          <div class="partial-maturity">
+            <span class="status-label prisma-label {prisma['css']}">{html.escape(prisma['label'])}</span>
+          </div>
+          <div class="evidence-loc">{file_line}</div>
+          {match_html}
+          <div class="partial-reqs">{met_html}{missing_html}</div>
+          <p class="partial-action">{html.escape(_suggest_partial_completion_action(ctrl))}</p>
+        </article>""")
+
+    return f"""
+    <section class="report-section partial-section">
+      <h2 class="section-heading">Partial Implementation</h2>
+      <p class="section-lead">
+        Evidence was found in code or infrastructure, but essential sub-requirements
+        are incomplete. These are distinct from total gaps — implementation started,
+        not absent.
+      </p>
+      <div class="evidence-list">{"".join(items)}</div>
+    </section>"""
+
+
+def _render_validated_section(
+    validated_controls: list[dict],
+    *,
+    has_partial: bool = False,
+) -> str:
     if not validated_controls:
-        return """
-    <section class="report-section validated-section">
+        if has_partial:
+            empty_body = (
+                "No controls met all requirements. Partial implementations "
+                "with verifiable evidence are listed above."
+            )
+        else:
+            empty_body = (
+                "This project shows no evidence of the assessed security controls "
+                "in its code or infrastructure."
+            )
+        return f"""
+    <section class="report-section validated-section validated-section--empty">
       <h2 class="section-heading">Validated Evidence</h2>
       <p class="section-lead">
-        Every validated control has verifiable evidence in the code.
+        Every fully validated control has complete, verifiable evidence in the code.
         AI proposes; only deterministic evidence certifies.
       </p>
-      <p class="section-empty">No controls with validated evidence in this evaluation.</p>
+      <div class="empty-state-callout" role="status">
+        <p class="empty-state-title">No controls passed full deterministic validation.</p>
+        <p class="empty-state-body">{empty_body}</p>
+      </div>
     </section>"""
 
     items = []
@@ -302,8 +473,9 @@ def _render_domain_table(metrics: dict) -> str:
         <tr>
           <td>{html.escape(_hitrust_domain_label(key))}</td>
           <td class="num">{stats["total"]}</td>
-          <td class="num status-validated">{stats["validated"]}</td>
-          <td class="num status-gap">{stats["gaps"]}</td>
+          {_domain_num_cell(stats["validated"], "validated")}
+          {_domain_num_cell(stats["partial"], "partial")}
+          {_domain_num_cell(stats["gaps"], "gaps")}
         </tr>""")
     if not domain_rows:
         return "<p class='section-empty'>No controls evaluated.</p>"
@@ -314,6 +486,7 @@ def _render_domain_table(metrics: dict) -> str:
           <th>HITRUST Domain</th>
           <th>Evaluated</th>
           <th>Validated</th>
+          <th>Partial</th>
           <th>Gaps</th>
         </tr>
       </thead>
@@ -375,6 +548,14 @@ def _render_technical_detail(
     caps_html: str,
 ) -> str:
     total = metrics["total"]
+    avg_prisma = metrics["avg_prisma"]
+    verifiable = metrics["verifiable_findings"]
+    partial_count = metrics["partial_count"]
+    gap_count = metrics["gap_count"]
+    partial_value_cls = " status-partial" if partial_count else ""
+    partial_value_cls += _metric_zero_class(partial_count)
+    gap_value_cls = " status-gap" if gap_count else ""
+    gap_value_cls += _metric_zero_class(gap_count)
     domain_table = _render_domain_table(metrics)
     refs_table = _render_normative_refs(controls)
     skipped_html = _render_skipped_files(skipped_files)
@@ -387,19 +568,23 @@ def _render_technical_detail(
           <h3 class="tech-heading">Coverage metrics</h3>
           <div class="tech-metrics">
             <div class="tech-metric">
-              <span class="tech-metric-value">{total} of {E1_TOTAL_CONTROL_REFS}</span>
+              <span class="tech-metric-value{_metric_zero_class(total)}">{total} of {E1_TOTAL_CONTROL_REFS}</span>
               <span class="tech-metric-label">e1 coverage</span>
             </div>
             <div class="tech-metric">
-              <span class="tech-metric-value">{metrics["avg_prisma"]:.1f}%</span>
+              <span class="tech-metric-value{_metric_zero_class(avg_prisma)}">{avg_prisma:.1f}%</span>
               <span class="tech-metric-label">Average PRISMA maturity</span>
             </div>
             <div class="tech-metric">
-              <span class="tech-metric-value">{metrics["verifiable_findings"]}</span>
+              <span class="tech-metric-value{_metric_zero_class(verifiable)}">{verifiable}</span>
               <span class="tech-metric-label">Findings with file:line</span>
             </div>
             <div class="tech-metric">
-              <span class="tech-metric-value status-gap">{metrics["gap_count"]}</span>
+              <span class="tech-metric-value{partial_value_cls}">{partial_count}</span>
+              <span class="tech-metric-label">Partial</span>
+            </div>
+            <div class="tech-metric">
+              <span class="tech-metric-value{gap_value_cls}">{gap_count}</span>
               <span class="tech-metric-label">Gaps (CAP)</span>
             </div>
           </div>
@@ -437,11 +622,11 @@ def _render_technical_detail(
             </div>
             <div class="scope-stat">
               <div class="scope-stat-label">Files scanned</div>
-              <div class="scope-stat-value">{files_scanned}</div>
+              <div class="scope-stat-value{_metric_zero_class(files_scanned)}">{files_scanned}</div>
             </div>
             <div class="scope-stat">
               <div class="scope-stat-label">Skipped files</div>
-              <div class="scope-stat-value">{len(skipped_files)}</div>
+              <div class="scope-stat-value{_metric_zero_class(len(skipped_files))}">{len(skipped_files)}</div>
             </div>
           </div>
           <div class="scope-subheading">Skipped files</div>
@@ -452,18 +637,22 @@ def _render_technical_detail(
 
 
 def _prisma_maturity(ctrl: dict) -> dict:
-    """Mapea validated/gap a terminología PRISMA y porcentaje de madurez."""
-    is_validated = (
-        ctrl.get("confidence") == "validated"
-        and ctrl.get("status") == "satisfied"
-    )
-    if is_validated:
+    """Mapea validated / partial / gap a terminología PRISMA y porcentaje de madurez."""
+    if _is_fully_validated(ctrl):
         return {
             "level": "Implemented",
             "pct": 50,
             "label": "Implemented (50%)",
             "css": "prisma-implemented",
             "bar_class": "prisma-bar-implemented",
+        }
+    if _is_partial(ctrl):
+        return {
+            "level": "Partially Implemented",
+            "pct": 25,
+            "label": "Partially Implemented (25%)",
+            "css": "prisma-partial",
+            "bar_class": "prisma-bar-partial",
         }
     return {
         "level": "Not Implemented",
@@ -472,6 +661,22 @@ def _prisma_maturity(ctrl: dict) -> dict:
         "css": "prisma-none",
         "bar_class": "prisma-bar-none",
     }
+
+
+def _suggest_partial_completion_action(ctrl: dict) -> str:
+    missing = _partial_missing_labels(ctrl)
+    if missing:
+        return (
+            "Complete the existing implementation: add missing requirements "
+            f"({', '.join(missing)})."
+        )
+    evidence = ctrl.get("evidence") or {}
+    if evidence.get("detail"):
+        return f"Complete the existing implementation: {evidence['detail']}"
+    return (
+        f"Complete control {ctrl.get('control_id', '')} — evidence found but "
+        "essential sub-requirements are not yet satisfied."
+    )
 
 
 def _suggest_cap_action(ctrl: dict) -> str:
@@ -516,32 +721,60 @@ def _suggest_cap_action(ctrl: dict) -> str:
 
 
 def _render_prisma_maturity_section(controls: list[dict]) -> str:
+    not_impl = [c for c in controls if _prisma_maturity(c)["level"] == "Not Implemented"]
     level_rows = []
+
     for level_name, pct, description in PRISMA_LEVELS:
         if level_name == "Implemented":
             at_level = [
                 c for c in controls
                 if _prisma_maturity(c)["level"] == "Implemented"
             ]
+        elif level_name == "Procedure":
+            at_level = [
+                c for c in controls
+                if _prisma_maturity(c)["level"] == "Partially Implemented"
+            ]
+            row_class = "prisma-row-partial" if at_level else "prisma-row-empty"
         else:
             at_level = []
-        controls_html = ", ".join(
-            html.escape(_format_control_id(c.get("control_id", ""))) for c in at_level
-        ) or "—"
+            row_class = "prisma-row-empty"
+
+        if level_name != "Procedure":
+            if at_level:
+                controls_html = ", ".join(
+                    html.escape(_format_control_id(c.get("control_id", ""))) for c in at_level
+                )
+                row_class = "prisma-row-populated"
+            else:
+                controls_html = _cell_dash()
+                row_class = "prisma-row-empty"
+        elif at_level:
+            controls_html = ", ".join(
+                html.escape(_format_control_id(c.get("control_id", ""))) for c in at_level
+            )
+        else:
+            controls_html = _cell_dash()
+
         level_rows.append(f"""
-        <tr>
+        <tr class="{row_class}">
           <td><strong>{html.escape(level_name)}</strong></td>
           <td class="pct-cell">{pct}%</td>
           <td>{html.escape(description)}</td>
           <td class="controls-cell">{controls_html}</td>
         </tr>""")
 
-    not_impl = [c for c in controls if _prisma_maturity(c)["level"] == "Not Implemented"]
-    not_impl_html = ", ".join(
-        html.escape(_format_control_id(c.get("control_id", ""))) for c in not_impl
-    ) or "—"
+    if not_impl:
+        not_impl_html = ", ".join(
+            html.escape(_format_control_id(c.get("control_id", ""))) for c in not_impl
+        )
+        not_impl_class = "prisma-row-populated prisma-row-not-implemented"
+    else:
+        not_impl_html = _cell_dash()
+        not_impl_class = "prisma-row-empty"
+
     level_rows.append(f"""
-    <tr>
+    <tr class="{not_impl_class}">
       <td><strong>Not Implemented</strong></td>
       <td class="pct-cell">0%</td>
       <td>No technical implementation evidence detected in code or infrastructure.</td>
@@ -552,8 +785,10 @@ def _render_prisma_maturity_section(controls: list[dict]) -> str:
     <p class="section-intro">
       The HITRUST PRISMA model defines five control maturity levels.
       This engine analyzes implementation in code and infrastructure; therefore,
-      most evaluated controls reach <strong>Implemented (50%)</strong>
-      when validated evidence exists, or <strong>Not Implemented (0%)</strong> when a gap is detected.
+      controls reach <strong>Implemented (50%)</strong> when fully validated,
+      <strong>Partially Implemented (25%)</strong> when evidence exists but
+      sub-requirements are incomplete, or <strong>Not Implemented (0%)</strong>
+      when no evidence is detected.
     </p>
     <table class="prisma-table">
       <thead>
@@ -629,22 +864,26 @@ def _render_report_html(job_id: str, job: dict) -> str:
         key=lambda c: c.get("patient_risk_score", 0),
         reverse=True,
     )
-    validated_controls = [
-        c for c in controls
-        if c.get("confidence") == "validated" and c.get("status") == "satisfied"
-    ]
-    gaps = [c for c in controls if c.get("status") in ("gap", "partial")]
+    validated_controls = [c for c in controls if _is_fully_validated(c)]
+    partial_controls = [c for c in controls if _is_partial(c)]
+    gaps = [c for c in controls if _is_gap(c)]
     top_gap = max(gaps, key=lambda c: c.get("patient_risk_score", 0)) if gaps else None
 
     metrics = _compute_report_metrics(controls)
     verdict_html = _render_verdict_section(
         metrics["compliance_score"],
         metrics["validated"],
+        metrics["partial_count"],
+        metrics["gap_count"],
         metrics["total"],
         top_gap,
     )
+    partial_html = _render_partial_section(partial_controls)
     action_html = _render_action_plan(gaps)
-    validated_html = _render_validated_section(validated_controls)
+    validated_html = _render_validated_section(
+        validated_controls,
+        has_partial=bool(partial_controls),
+    )
     prisma_html = _render_prisma_maturity_section(controls)
     caps_html = _render_caps_section(gaps)
     technical_html = _render_technical_detail(
@@ -666,90 +905,130 @@ def _render_report_html(job_id: str, job: dict) -> str:
   <title>HITRUST CSF Assessment Report — {repo_name}</title>
   <style>
     *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+
+    /* Spacing scale: 8px base (8, 16, 24, 32, 40, 48, 56, 64) */
     body {{
-      font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+      font-family: -apple-system, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
       font-size: 14px;
-      line-height: 1.55;
+      line-height: 1.6;
       color: #1a1a1a;
       background: #fff;
     }}
     .page {{
       max-width: 880px;
       margin: 0 auto;
-      padding: 40px 40px 64px;
+      padding: 48px 40px 64px;
     }}
 
-    /* —— Meta header (discreto) —— */
+    /* —— Meta header —— */
     .report-meta {{
-      margin-bottom: 32px;
+      margin-bottom: 40px;
       padding-bottom: 16px;
       border-bottom: 1px solid #e8e8e8;
     }}
     .report-meta .repo-name {{
       font-family: Georgia, "Times New Roman", Times, serif;
-      font-size: 1rem;
+      font-size: 1.125rem;
+      font-weight: 400;
       color: #1e3a5f;
-      margin-bottom: 4px;
+      margin-bottom: 8px;
+      line-height: 1.4;
     }}
     .report-meta .meta-line {{
-      font-size: 0.72rem;
+      font-size: 0.6875rem;
       color: #767676;
       text-transform: uppercase;
-      letter-spacing: 0.06em;
+      letter-spacing: 0.05em;
+      line-height: 1.5;
     }}
 
-    /* —— NIVEL 1: Veredicto —— */
+    /* —— Verdict —— */
     .verdict {{
-      margin-bottom: 56px;
-      padding-bottom: 40px;
+      margin-bottom: 40px;
+      padding-bottom: 32px;
       border-bottom: 2px solid #1a1a1a;
     }}
     .verdict-main {{
-      display: flex;
-      align-items: flex-end;
-      justify-content: space-between;
-      gap: 32px;
-      margin-bottom: 28px;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      grid-template-rows: auto auto auto;
+      column-gap: 48px;
+      row-gap: 8px;
+      align-items: start;
+      margin-bottom: 24px;
+    }}
+    .verdict-score-block {{
+      display: contents;
     }}
     .verdict-score {{
+      grid-column: 1;
+      grid-row: 1;
       font-family: Georgia, "Times New Roman", Times, serif;
-      font-size: 5.5rem;
+      font-size: 5rem;
       font-weight: 400;
       line-height: 1;
       color: #1a1a1a;
       letter-spacing: -0.02em;
+      font-variant-numeric: tabular-nums;
+      min-width: 3.5ch;
+    }}
+    .verdict--score-zero .verdict-score {{
+      color: #1a1a1a;
+    }}
+    .verdict--all-gaps .verdict-main {{
+      min-height: 88px;
+    }}
+    .verdict--all-gaps .verdict-score {{
+      font-size: 5rem;
+    }}
+    .verdict--all-gaps .readiness-badge.readiness-low {{
+      min-width: 88px;
+      text-align: center;
     }}
     .verdict-score-label {{
-      font-size: 0.7rem;
+      grid-column: 1;
+      grid-row: 2;
+      font-size: 0.6875rem;
+      font-weight: 400;
       text-transform: uppercase;
-      letter-spacing: 0.1em;
+      letter-spacing: 0.05em;
       color: #767676;
-      margin-top: 10px;
+      line-height: 1.5;
     }}
     .verdict-score-detail {{
-      font-size: 1.05rem;
+      grid-column: 1;
+      grid-row: 3;
+      font-size: 1rem;
       color: #4a4a4a;
-      margin-top: 6px;
+      line-height: 1.6;
+      font-variant-numeric: tabular-nums;
     }}
     .verdict-readiness {{
+      grid-column: 2;
+      grid-row: 1;
       display: flex;
       flex-direction: column;
       align-items: flex-end;
       gap: 8px;
-      flex-shrink: 0;
+      align-self: start;
+      padding-top: 8px;
     }}
     .readiness-label {{
-      font-size: 0.65rem;
+      font-size: 0.6875rem;
+      font-weight: 400;
       text-transform: uppercase;
-      letter-spacing: 0.08em;
+      letter-spacing: 0.05em;
       color: #767676;
+      line-height: 1.5;
     }}
     .readiness-badge {{
-      font-size: 1.35rem;
-      font-weight: 600;
+      font-family: Georgia, "Times New Roman", Times, serif;
+      font-size: 1.25rem;
+      font-weight: 400;
       letter-spacing: 0.02em;
-      padding: 6px 16px;
-      border: 2px solid;
+      padding: 8px 16px;
+      border: 1px solid;
+      line-height: 1.2;
     }}
     .readiness-high {{
       color: #2d6a4f;
@@ -764,53 +1043,89 @@ def _render_report_html(job_id: str, job: dict) -> str:
       border-color: #9b2226;
     }}
     .verdict-critical {{
-      font-size: 1.05rem;
+      font-size: 0.9375rem;
       color: #1a1a1a;
-      line-height: 1.5;
-      padding: 14px 18px;
+      line-height: 1.6;
+      padding: 16px;
       background: #fafafa;
       border-left: 4px solid #9b2226;
+      font-variant-numeric: tabular-nums;
     }}
-    .verdict-critical strong {{ font-weight: 600; }}
+    .verdict-critical strong {{
+      font-family: Georgia, "Times New Roman", Times, serif;
+      font-weight: 400;
+    }}
     .verdict-critical.verdict-clear {{
       border-left-color: #2d6a4f;
       color: #4a4a4a;
     }}
 
-    /* —— NIVEL 2–3: Secciones principales —— */
+    /* —— Main sections —— */
     .report-section {{
-      margin-bottom: 52px;
+      margin-bottom: 40px;
+      padding-bottom: 0;
       page-break-inside: avoid;
+    }}
+    .report-section:last-of-type {{
+      margin-bottom: 32px;
+    }}
+    .validated-section--empty .section-lead {{
+      margin-bottom: 16px;
+    }}
+    .empty-state-callout {{
+      padding: 24px;
+      background: #fafafa;
+      border: 1px solid #e8e8e8;
+      border-left: 4px solid #767676;
+    }}
+    .empty-state-title {{
+      font-family: Georgia, "Times New Roman", Times, serif;
+      font-size: 0.9375rem;
+      font-weight: 400;
+      color: #1a1a1a;
+      line-height: 1.5;
+      margin-bottom: 8px;
+    }}
+    .empty-state-body {{
+      font-size: 0.875rem;
+      color: #4a4a4a;
+      line-height: 1.6;
+      max-width: 560px;
     }}
     .section-heading {{
       font-family: Georgia, "Times New Roman", Times, serif;
-      font-size: 1.35rem;
+      font-size: 0.8125rem;
       font-weight: 400;
-      color: #1a1a1a;
-      margin-bottom: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: #767676;
+      margin-bottom: 16px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid #e8e8e8;
+      line-height: 1.5;
     }}
     .section-lead {{
-      font-size: 0.9rem;
+      font-size: 0.875rem;
       color: #4a4a4a;
       margin-bottom: 24px;
-      line-height: 1.65;
+      line-height: 1.6;
       max-width: 640px;
     }}
     .section-empty {{
-      font-size: 0.85rem;
+      font-size: 0.875rem;
       color: #767676;
       font-style: italic;
+      line-height: 1.6;
     }}
 
     /* —— Action Plan —— */
     .action-list {{
       list-style: none;
-      counter-reset: action;
     }}
     .action-item {{
       display: flex;
       gap: 16px;
-      padding: 18px 0;
+      padding: 16px 0;
       border-bottom: 1px solid #e8e8e8;
     }}
     .action-item:first-child {{
@@ -818,18 +1133,21 @@ def _render_report_html(job_id: str, job: dict) -> str:
     }}
     .action-rank {{
       font-family: Georgia, "Times New Roman", Times, serif;
-      font-size: 1.5rem;
+      font-size: 1.25rem;
+      font-weight: 400;
       color: #9b2226;
-      min-width: 28px;
+      min-width: 32px;
       line-height: 1.2;
       flex-shrink: 0;
+      font-variant-numeric: tabular-nums;
+      text-align: right;
     }}
     .action-title {{
       display: flex;
       flex-wrap: wrap;
       align-items: baseline;
-      gap: 8px 12px;
-      margin-bottom: 6px;
+      gap: 8px 16px;
+      margin-bottom: 8px;
     }}
     .control-id {{
       font-family: ui-monospace, "Cascadia Code", monospace;
@@ -837,20 +1155,22 @@ def _render_report_html(job_id: str, job: dict) -> str:
       color: #767676;
     }}
     .action-name {{
+      font-family: Georgia, "Times New Roman", Times, serif;
       font-size: 1rem;
-      font-weight: 600;
+      font-weight: 400;
       color: #1a1a1a;
+      line-height: 1.4;
     }}
     .risk-score {{
-      font-size: 0.75rem;
+      font-size: 0.6875rem;
       font-variant-numeric: tabular-nums;
       color: #9b2226;
-      font-weight: 600;
+      font-weight: 400;
       text-transform: uppercase;
-      letter-spacing: 0.04em;
+      letter-spacing: 0.05em;
     }}
     .action-text {{
-      font-size: 0.88rem;
+      font-size: 0.875rem;
       color: #4a4a4a;
       line-height: 1.6;
     }}
@@ -859,10 +1179,9 @@ def _render_report_html(job_id: str, job: dict) -> str:
     .evidence-list {{
       display: flex;
       flex-direction: column;
-      gap: 0;
     }}
     .evidence-item {{
-      padding: 20px 0;
+      padding: 16px 0;
       border-bottom: 1px solid #e8e8e8;
     }}
     .evidence-item:first-child {{
@@ -871,7 +1190,7 @@ def _render_report_html(job_id: str, job: dict) -> str:
     .evidence-header {{
       display: flex;
       align-items: baseline;
-      gap: 10px;
+      gap: 8px;
       margin-bottom: 8px;
     }}
     .evidence-name {{
@@ -879,40 +1198,44 @@ def _render_report_html(job_id: str, job: dict) -> str:
       font-size: 1rem;
       font-weight: 400;
       color: #1a1a1a;
+      line-height: 1.4;
     }}
     .evidence-loc {{
       font-family: ui-monospace, "Cascadia Code", monospace;
-      font-size: 0.82rem;
+      font-size: 0.8125rem;
       color: #1e3a5f;
+      line-height: 1.5;
     }}
     .evidence-match {{
       margin-top: 8px;
-      padding: 10px 12px;
+      padding: 8px 16px;
       background: #f5f5f5;
       border: 1px solid #e8e8e8;
       font-family: ui-monospace, "Cascadia Code", monospace;
       font-size: 0.75rem;
+      line-height: 1.6;
       overflow-x: auto;
       white-space: pre-wrap;
       word-break: break-word;
     }}
 
-    /* —— LEVEL 4: Technical detail (collapsible) —— */
+    /* —— Technical detail (collapsible) —— */
     .technical-details {{
-      margin-top: 16px;
+      margin-top: 8px;
       margin-bottom: 32px;
       border: 1px solid #d0d0d0;
     }}
     .technical-summary {{
-      font-size: 0.8rem;
-      font-weight: 600;
+      font-size: 0.6875rem;
+      font-weight: 400;
       text-transform: uppercase;
-      letter-spacing: 0.07em;
-      color: #4a4a4a;
-      padding: 14px 18px;
+      letter-spacing: 0.05em;
+      color: #767676;
+      padding: 16px;
       cursor: pointer;
       list-style: none;
       background: #fafafa;
+      line-height: 1.5;
     }}
     .technical-summary::-webkit-details-marker {{ display: none; }}
     .technical-summary::before {{
@@ -923,69 +1246,96 @@ def _render_report_html(job_id: str, job: dict) -> str:
       content: "▾ ";
     }}
     .technical-body {{
-      padding: 24px 18px 8px;
-      font-size: 0.82rem;
+      padding: 24px 16px 16px;
+      font-size: 0.875rem;
       color: #4a4a4a;
+      line-height: 1.6;
     }}
     .tech-block {{
       margin-bottom: 32px;
     }}
-    .tech-block:last-child {{ margin-bottom: 8px; }}
+    .tech-block:last-child {{ margin-bottom: 0; }}
     .tech-heading {{
-      font-size: 0.72rem;
-      font-weight: 600;
+      font-size: 0.6875rem;
+      font-weight: 400;
       text-transform: uppercase;
-      letter-spacing: 0.06em;
+      letter-spacing: 0.05em;
       color: #767676;
-      margin-bottom: 14px;
-      padding-bottom: 6px;
+      margin-bottom: 16px;
+      padding-bottom: 8px;
       border-bottom: 1px solid #e8e8e8;
+      line-height: 1.5;
     }}
     .tech-metrics {{
       display: grid;
-      grid-template-columns: repeat(4, 1fr);
+      grid-template-columns: repeat(5, 1fr);
       gap: 16px;
-      margin-bottom: 12px;
+      margin-bottom: 16px;
     }}
     .tech-metric {{
-      text-align: center;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: flex-start;
+      gap: 8px;
+      padding: 16px;
+      min-height: 96px;
+      background: #fafafa;
+      border: 1px solid #e8e8e8;
     }}
     .tech-metric-value {{
       display: block;
-      font-size: 1.1rem;
+      width: 100%;
+      min-height: 1.5rem;
+      font-size: 1.25rem;
+      font-weight: 400;
+      line-height: 1.2;
       color: #1a1a1a;
       font-variant-numeric: tabular-nums;
+      text-align: center;
+    }}
+    .tech-metric-value.metric-is-zero {{
+      color: #1a1a1a;
+    }}
+    .tech-metric-value.metric-is-zero.status-gap {{
+      color: #767676;
     }}
     .tech-metric-label {{
       display: block;
-      font-size: 0.62rem;
+      width: 100%;
+      font-size: 0.6875rem;
+      font-weight: 400;
       text-transform: uppercase;
-      letter-spacing: 0.06em;
+      letter-spacing: 0.05em;
       color: #767676;
-      margin-top: 4px;
+      line-height: 1.4;
+      text-align: center;
+      margin-top: auto;
     }}
     .tech-note {{
-      font-size: 0.78rem;
+      font-size: 0.8125rem;
       color: #767676;
-      line-height: 1.5;
+      line-height: 1.6;
+      font-variant-numeric: tabular-nums;
     }}
     .tech-table, .prisma-table, .caps-table {{
       width: 100%;
       border-collapse: collapse;
-      font-size: 0.8rem;
+      font-size: 0.8125rem;
+      line-height: 1.6;
     }}
     .tech-table th, .prisma-table th, .caps-table th {{
       text-align: left;
-      padding: 7px 10px;
+      padding: 8px 16px;
       border-bottom: 1px solid #1a1a1a;
-      font-size: 0.62rem;
+      font-size: 0.6875rem;
+      font-weight: 400;
       text-transform: uppercase;
       letter-spacing: 0.05em;
       color: #767676;
-      font-weight: 600;
     }}
     .tech-table td, .prisma-table td, .caps-table td {{
-      padding: 8px 10px;
+      padding: 8px 16px;
       border-bottom: 1px solid #e8e8e8;
       vertical-align: top;
       color: #4a4a4a;
@@ -994,72 +1344,186 @@ def _render_report_html(job_id: str, job: dict) -> str:
       text-align: right;
       font-variant-numeric: tabular-nums;
     }}
-    .prisma-table .pct-cell {{ font-variant-numeric: tabular-nums; white-space: nowrap; }}
+    .tech-table .num-zero {{
+      color: #4a4a4a;
+    }}
+    .cell-dash {{
+      display: inline-block;
+      min-width: 1.25em;
+      color: #767676;
+      text-align: center;
+    }}
+    .prisma-table .prisma-row-empty .controls-cell {{
+      color: #767676;
+    }}
+    .prisma-table .prisma-row-not-implemented {{
+      background: #fafafa;
+    }}
+    .prisma-table .prisma-row-not-implemented td {{
+      border-bottom-color: #d0d0d0;
+    }}
+    .prisma-table .prisma-row-not-implemented .controls-cell {{
+      color: #1a1a1a;
+    }}
+    .prisma-table .pct-cell {{
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+      text-align: right;
+    }}
     .prisma-table .controls-cell, .refs-cell {{
       font-family: ui-monospace, monospace;
       font-size: 0.75rem;
     }}
-    .mono {{ font-family: ui-monospace, monospace; font-size: 0.8rem; }}
+    .mono {{
+      font-family: ui-monospace, monospace;
+      font-size: 0.8125rem;
+    }}
     .status-validated {{ color: #2d6a4f; }}
+    .status-partial {{ color: #9a6b2f; }}
     .status-gap {{ color: #9b2226; }}
+    .status-badge {{
+      font-size: 0.6875rem;
+      font-weight: 400;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      padding: 4px 8px;
+      border: 1px solid;
+      line-height: 1.2;
+      flex-shrink: 0;
+    }}
+    .status-badge-partial {{
+      color: #9a6b2f;
+      border-color: #c9a227;
+      background: #fdf8ee;
+    }}
     .status-label {{
-      font-size: 0.65rem;
-      font-weight: 600;
+      font-size: 0.6875rem;
+      font-weight: 400;
       text-transform: uppercase;
       letter-spacing: 0.05em;
     }}
     .status-label.prisma-implemented {{ color: #1e3a5f; }}
+    .status-label.prisma-partial {{ color: #9a6b2f; }}
     .status-label.prisma-none {{ color: #9b2226; }}
-    .section-intro {{
-      font-size: 0.78rem;
+    .partial-section .evidence-item:first-child {{
+      border-top: 2px solid #c9a227;
+    }}
+    .partial-maturity {{
+      margin-bottom: 8px;
+    }}
+    .partial-reqs {{
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      margin-top: 12px;
+    }}
+    .partial-req-label {{
+      display: block;
+      font-size: 0.6875rem;
+      font-weight: 400;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
       color: #767676;
-      margin-bottom: 14px;
+      margin-bottom: 4px;
+    }}
+    .partial-req-list {{
+      margin: 0;
+      padding-left: 1.25rem;
+      font-size: 0.8125rem;
+      color: #4a4a4a;
+      line-height: 1.6;
+    }}
+    .partial-req--met .partial-req-list {{
+      color: #2d6a4f;
+    }}
+    .partial-req--missing .partial-req-list {{
+      color: #9a6b2f;
+    }}
+    .partial-detail {{
+      font-size: 0.8125rem;
+      color: #9a6b2f;
+      line-height: 1.6;
+      margin: 0;
+    }}
+    .partial-action {{
+      margin-top: 12px;
+      font-size: 0.8125rem;
+      color: #4a4a4a;
+      line-height: 1.6;
+      font-style: italic;
+    }}
+    .prisma-table .prisma-row-partial {{
+      background: #fdf8ee;
+    }}
+    .section-intro {{
+      font-size: 0.8125rem;
+      color: #767676;
+      margin-bottom: 16px;
       line-height: 1.6;
     }}
     .scope-grid {{
       display: grid;
       grid-template-columns: repeat(3, 1fr);
       gap: 16px;
-      margin-bottom: 20px;
+      margin-bottom: 24px;
+    }}
+    .scope-stat {{
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      padding: 16px;
+      min-height: 80px;
+      background: #fafafa;
+      border: 1px solid #e8e8e8;
     }}
     .scope-stat-label {{
-      font-size: 0.62rem;
+      font-size: 0.6875rem;
+      font-weight: 400;
       text-transform: uppercase;
-      letter-spacing: 0.06em;
+      letter-spacing: 0.05em;
       color: #767676;
-      margin-bottom: 4px;
+      line-height: 1.5;
     }}
     .scope-stat-value {{
-      font-size: 0.82rem;
+      font-size: 0.875rem;
       color: #4a4a4a;
+      line-height: 1.6;
+      font-variant-numeric: tabular-nums;
       word-break: break-all;
+      min-height: 1.5rem;
+    }}
+    .scope-stat-value.metric-is-zero {{
+      color: #4a4a4a;
     }}
     .scope-stat-value.mono {{
       font-family: ui-monospace, monospace;
-      font-size: 0.75rem;
+      font-size: 0.8125rem;
+      font-variant-numeric: normal;
     }}
     .scope-subheading {{
-      font-size: 0.62rem;
-      font-weight: 600;
+      font-size: 0.6875rem;
+      font-weight: 400;
       text-transform: uppercase;
-      letter-spacing: 0.06em;
+      letter-spacing: 0.05em;
       color: #767676;
-      margin: 8px 0 10px;
+      margin: 0 0 8px;
+      line-height: 1.5;
     }}
     .scope-empty {{
-      font-size: 0.78rem;
+      font-size: 0.8125rem;
       color: #767676;
       font-style: italic;
+      line-height: 1.6;
     }}
 
     /* —— Footer —— */
     .footer-note {{
-      margin-top: 8px;
-      padding-top: 20px;
+      margin-top: 16px;
+      padding-top: 24px;
       border-top: 1px solid #d0d0d0;
-      font-size: 0.78rem;
+      font-size: 0.8125rem;
       color: #767676;
-      line-height: 1.65;
+      line-height: 1.6;
     }}
     .footer-note strong {{
       font-family: Georgia, "Times New Roman", Times, serif;
@@ -1068,11 +1532,20 @@ def _render_report_html(job_id: str, job: dict) -> str:
     }}
 
     @media (max-width: 720px) {{
-      .page {{ padding: 24px 20px 48px; }}
-      .verdict-main {{ flex-direction: column; align-items: flex-start; }}
-      .verdict-readiness {{ align-items: flex-start; }}
+      .page {{ padding: 24px 16px 48px; }}
+      .verdict-main {{
+        grid-template-columns: 1fr;
+        row-gap: 16px;
+      }}
       .verdict-score {{ font-size: 4rem; }}
+      .verdict-readiness {{
+        grid-column: 1;
+        grid-row: 4;
+        align-items: flex-start;
+        padding-top: 0;
+      }}
       .tech-metrics {{ grid-template-columns: repeat(2, 1fr); }}
+      .partial-reqs {{ grid-template-columns: 1fr; }}
       .scope-grid {{ grid-template-columns: 1fr; }}
     }}
     @media print {{
@@ -1093,6 +1566,8 @@ def _render_report_html(job_id: str, job: dict) -> str:
     </header>
 
     {verdict_html}
+
+    {partial_html}
 
     {action_html}
 
@@ -1164,9 +1639,10 @@ async def get_summary(job_id: str):
 
     controls = job["result"]["controls"]
     total = len(controls)
-    validated = sum(1 for c in controls if c["confidence"] == "validated")
+    validated = sum(1 for c in controls if _is_fully_validated(c))
+    partial_count = sum(1 for c in controls if _is_partial(c))
     proposed = sum(1 for c in controls if c["confidence"] == "proposed")
-    gaps = [c for c in controls if c["status"] in ("gap", "partial")]
+    gaps = [c for c in controls if _is_gap(c)]
 
     top_gap = None
     if gaps:
@@ -1177,18 +1653,17 @@ async def get_summary(job_id: str):
             "patient_risk_score": top["patient_risk_score"],
         }
 
+    breakdown = _format_control_breakdown(validated, partial_count, len(gaps), total)
     if top_gap:
-        headline = (
-            f"{validated} de {total} controles certificados; "
-            f"gap crítico: {top_gap['name']}"
-        )
+        headline = f"{breakdown}; gap crítico: {top_gap['name']}"
     else:
-        headline = f"{validated} de {total} controles certificados; sin gaps críticos"
+        headline = f"{breakdown}; sin gaps críticos"
 
     return {
         "analysis_id": job_id,
         "total_controls": total,
         "validated": validated,
+        "partial": partial_count,
         "proposed": proposed,
         "gaps": len(gaps),
         "top_gap": top_gap,

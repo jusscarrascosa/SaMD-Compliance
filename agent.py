@@ -83,14 +83,20 @@ def run_analysis(repo_path: str) -> dict:
     # --- PASO 1: el agente PLANIFICA (LLM) ---
     inventory = build_inventory(repo)
     plan_prompt = (
-        "Sos un agente de compliance HITRUST para software médico (SaMD). "
-        "Dado este inventario de repo, listá en JSON qué controles del catálogo "
-        f"deberías chequear. Catálogo disponible: {list(CONTROL_REGISTRY.keys())}. "
-        f"Inventario: {json.dumps(inventory['modules'][:20])}. "
-        'Respondé SOLO JSON: {"controls_to_check": [...]}'
+        "You are a HITRUST compliance agent for Software as a Medical Device (SaMD). "
+        "Given this repository inventory, list in JSON which controls from the catalog "
+        "you should check. Available catalog: {catalog}. "
+        "Inventory: {inventory}. "
+        'Respond with ONLY JSON: {{"controls_to_check": [...]}}'
+    ).format(
+        catalog=list(CONTROL_REGISTRY.keys()),
+        inventory=json.dumps(inventory["modules"][:20]),
     )
     try:
-        plan_raw = _llm("Devolvés solo JSON válido, sin markdown.", plan_prompt)
+        plan_raw = _llm(
+            "Return only valid JSON, no markdown. Always respond in English.",
+            plan_prompt,
+        )
         plan = json.loads(plan_raw.strip().strip("`").replace("json", "", 1).strip())
         controls_to_check = plan.get("controls_to_check", list(CONTROL_REGISTRY.keys()))
     except Exception:
@@ -104,14 +110,17 @@ def run_analysis(repo_path: str) -> dict:
 
         # --- PASO 2: el agente PROPONE con contexto (LLM) ---
         propose_prompt = (
-            f"Control HITRUST: {control_id} ({spec['name']}). "
-            f"Módulos que tocan PHI: {inventory['phi_modules']}. "
-            "¿Esperás que este control esté implementado? Respondé en una frase."
+            f"HITRUST control: {control_id} ({spec['name']}). "
+            f"Modules that touch PHI: {inventory['phi_modules']}. "
+            "Do you expect this control to be implemented? Answer in one sentence."
         )
         try:
-            proposal = _llm("Sos un ingeniero de seguridad conciso.", propose_prompt)
+            proposal = _llm(
+                "You are a concise security engineer. Always respond in English.",
+                propose_prompt,
+            )
         except Exception:
-            proposal = "propuesta no disponible"
+            proposal = "proposal unavailable"
 
         # --- PASO 3: recuperación multi-paso + VALIDADOR DETERMINÍSTICO (SIN LLM) ---
         evidence, retrieval_steps = _retrieve_with_fallback(repo, spec)
