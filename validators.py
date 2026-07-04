@@ -6,13 +6,13 @@ o None. Esto es la traducción directa del principio de XBOW:
 """
 from __future__ import annotations
 import re
+from collections.abc import Callable
 from pathlib import Path
 from datetime import datetime, timezone
 
 from analysis import (
     CODE_CONFIG_EXTENSIONS,
     find_all_pattern_hits,
-    find_pattern_in_text,
     iter_repo_files,
 )
 
@@ -49,11 +49,15 @@ def _scan_repo(
     extensions: frozenset[str],
     evidence_type: str,
     detail_fn,
+    line_skip: Callable[[str], bool] | None = None,
+    path_skip: Callable[[Path, Path], bool] | None = None,
 ) -> dict | None:
     """Busca el primer match en el repo y devuelve evidencia con file:line."""
     for path in iter_repo_files(repo, extensions):
+        if path_skip and path_skip(path, repo):
+            continue
         text = path.read_text(errors="ignore")
-        hit = find_pattern_in_text(text, patterns)
+        hit = _find_pattern_in_text(text, patterns, line_skip=line_skip)
         if hit:
             return _evidence(
                 repo,
@@ -64,6 +68,48 @@ def _scan_repo(
                 evidence_type,
             )
     return None
+
+
+def _find_pattern_in_text(
+    text: str,
+    patterns: list[tuple[re.Pattern[str], str]],
+    line_skip: Callable[[str], bool] | None = None,
+) -> dict | None:
+    """Primera coincidencia con número de línea; omite líneas que fallen line_skip."""
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        if line_skip and line_skip(line):
+            continue
+        for pattern, label in patterns:
+            if pattern.search(line):
+                return {
+                    "line": line_no,
+                    "match": line.strip(),
+                    "label": label,
+                }
+    return None
+
+
+# Líneas de hash/digest — no son cifrado en reposo (HITRUST 06.d).
+_HASH_LINE_RE = re.compile(
+    r"\b(digest|\.hash\s*\(|sha[-_]?\d+|md5|bcrypt|scrypt|pbkdf2|hmac|hashlib)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_hash_line(line: str) -> bool:
+    return bool(_HASH_LINE_RE.search(line))
+
+
+_TEST_FILE_RE = re.compile(r"\.(test|spec)\.(ts|tsx|js|jsx)$", re.IGNORECASE)
+_TEST_DIR_NAMES = frozenset({"__tests__", "test", "tests"})
+
+
+def _is_test_file(path: Path, repo: Path) -> bool:
+    """Excluye archivos y carpetas de test del escaneo de audit logging."""
+    if _TEST_FILE_RE.search(path.name):
+        return True
+    rel_parts = path.relative_to(repo).parts[:-1]
+    return any(part in _TEST_DIR_NAMES for part in rel_parts)
 
 
 # --- HITRUST 06.d: cifrado en reposo ---
@@ -81,12 +127,13 @@ _ENCRYPTION_CODE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"from\s+cryptography|import\s+cryptography", re.I), "cryptography library"),
     (re.compile(r"Fernet\s*\(", re.I), "Fernet (cryptography)"),
     (re.compile(r"AES\.new\s*\(", re.I), "AES"),
-    (re.compile(r"from\s+bcrypt|import\s+bcrypt|bcrypt\.", re.I), "bcrypt"),
     (re.compile(r"encryption_at_rest", re.I), "encryption_at_rest"),
     (re.compile(r"""["']encrypted["']\s*:\s*true""", re.I), '"encrypted": true'),
     (re.compile(r"ENCRYPTION_KEY|encryption_key", re.I), "encryption_key"),
     (re.compile(r"\.encrypt\s*\(", re.I), "encrypt()"),
-    (re.compile(r"createCipher|createDecipher|crypto\.subtle", re.I), "crypto API"),
+    (re.compile(r"\.decrypt\s*\(", re.I), "decrypt()"),
+    (re.compile(r"createCipher(?:iv)?|createDecipher(?:iv)?", re.I), "Node crypto cipher"),
+    (re.compile(r"crypto\.subtle\.(?:encrypt|decrypt)", re.I), "Web Crypto encrypt/decrypt"),
 ]
 
 _TF_EXTENSIONS = frozenset({".tf", ".tfvars"})
@@ -112,6 +159,8 @@ def validate_encryption_at_rest_python(repo: Path) -> dict | None:
         _APP_CODE_EXTENSIONS,
         "code_check",
         lambda h: f"cifrado a nivel aplicación detectado ({h['label']})",
+        line_skip=_is_hash_line,
+        path_skip=_is_test_file,
     )
 
 
@@ -145,30 +194,52 @@ def validate_mfa(repo: Path) -> dict | None:
 # --- HITRUST 09.aa: audit logging ---
 
 _AUDIT_LOGGING_RE = re.compile(
-    r"(audit_log|audit\.log|logger\.(info|warning|error|debug)|"
-    r"logging\.(info|warning|error|debug)|_audit\s*\(|\.append\s*\(\s*\{)",
+    r"(?:audit_log|audit\.log|logAuditEvent|createAuditEvent|"
+    r"logger\.(?:info|warning|error|debug)|"
+    r"logging\.(?:info|warning|error|debug)|_audit\s*\(|\.append\s*\(\s*\{)",
     re.IGNORECASE,
 )
 
+# Valores concretos en campos de log — excluye declaraciones de tipo (p. ej. `who: Reference`).
+_TYPE_ONLY_VALUE = r"(?:string|number|boolean|undefined|null|Reference|Date|Record|Partial)\b"
+# Tras `:` exige valor real; el lookahead evita backtracking que aceptaba solo el nombre del campo.
+_FIELD_VALUE = r"(?=\S)(?!" + _TYPE_ONLY_VALUE + r")"
+
+
+def _is_audit_definition_file(rel: str, text: str) -> bool:
+    """Archivo que define audit events, no solo los importa."""
+    if re.search(r"audit", rel, re.IGNORECASE):
+        return True
+    return bool(re.search(
+        r"(?:export\s+)?function\s+(?:createAuditEvent|logAuditEvent)\b",
+        text,
+    ))
+
+
 _AUDIT_SUB_REQ_PATTERNS: dict[str, re.Pattern[str]] = {
     "user_identifier": re.compile(
-        r"\b(user_id|userid|userId|actor|principal|username|client_id|client)\b|"
-        r"['\"]user['\"]",
+        r"(?:^|[,{[\s])(?:user_id|userid|userId|username|actor_id|actorId|"
+        r"principal_id|principalId)\s*:\s*" + _FIELD_VALUE +
+        r"|['\"](?:user_id|userId|userid|username|actor|principal|who)['\"]\s*:"
+        r"|\bwho\s*:\s*" + _FIELD_VALUE,
         re.IGNORECASE,
     ),
     "timestamp": re.compile(
-        r"\b(timestamp|time_stamp|datetime|logged_at|created_at|"
-        r"event_time|fecha|date_time|isoformat)\b|['\"]ts['\"]",
+        r"(?:^|[,{[\s])(?:timestamp|logged_at|event_time|recorded|date_time)\s*:\s*"
+        r"(?:new Date|Date\.|['\"`]|`\$\{|\d)"
+        r"|['\"](?:timestamp|logged_at|event_time|recorded|ts)['\"]\s*:"
+        r"|\.isoformat\s*\(",
         re.IGNORECASE,
     ),
     "action": re.compile(
-        r"\b(action|event_type|operation|activity|event_name|"
-        r"audit_event|function_name)\b|['\"]action['\"]",
+        r"(?:^|[,{[\s])action\s*:\s*" + _FIELD_VALUE +
+        r"|['\"](?:action|event_type|activity)['\"]\s*:",
         re.IGNORECASE,
     ),
     "retention_policy": re.compile(
-        r"\b(retention|retain|retention_days|retention_policy|"
-        r"log_retention|ttl|expire|expiry|purge|archive_after)\b",
+        r"(?:^|[,{[\s])(?:retention_days|retention_policy|log_retention|retention_period)\s*[:=]"
+        r"|\b(?:retention|retain)\s+(?:days|period|policy)\b"
+        r"|(?:purge_after|archive_after|expire_after)\s*[:=]\s*\d",
         re.IGNORECASE,
     ),
 }
@@ -190,6 +261,29 @@ _AUDIT_TF_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"enable_logging\s*=\s*true", re.I), "enable_logging=true"),
     (re.compile(r"audit_log|cloudtrail", re.I), "audit infra"),
 ]
+
+
+def _collect_audit_sub_requirement_text(
+    text: str,
+    rel: str,
+    file_hits: list[dict],
+) -> str:
+    """Texto acotado para sub-requisitos: contexto de hits + módulos audit reales."""
+    lines = text.splitlines()
+    chunks: list[str] = []
+    seen: set[int] = set()
+
+    for hit in file_hits:
+        idx = hit["line"] - 1
+        for i in range(max(0, idx - 2), min(len(lines), idx + 3)):
+            if i not in seen:
+                seen.add(i)
+                chunks.append(lines[i])
+
+    if _is_audit_definition_file(rel, text):
+        chunks.append(text)
+
+    return "\n".join(chunks)
 
 
 def _scan_audit_sub_requirements(text: str) -> dict[str, dict]:
@@ -215,6 +309,8 @@ def validate_audit_logging_python(repo: Path) -> dict | None:
     audit_text_parts: list[str] = []
 
     for path in iter_repo_files(repo, _AUDIT_CODE_EXTENSIONS):
+        if _is_test_file(path, repo):
+            continue
         text = path.read_text(errors="ignore")
         file_hits = find_all_pattern_hits(
             text,
@@ -229,7 +325,7 @@ def validate_audit_logging_python(repo: Path) -> dict | None:
                 "line": hit["line"],
                 "match": hit["match"],
             })
-        audit_text_parts.append(text)
+        audit_text_parts.append(_collect_audit_sub_requirement_text(text, rel, file_hits))
 
     if not logging_locations:
         return None
@@ -314,7 +410,7 @@ CONTROL_REGISTRY = {
         "fallback_validator": validate_encryption_at_rest_python,
         "fallback_source": {
             "id": "python_code",
-            "label": "Código de aplicación (cryptography, bcrypt, encrypt)",
+            "label": "Código de aplicación (cryptography, AES, encrypt/decrypt)",
         },
         "clinical_proximity": "data_storage",
     },
